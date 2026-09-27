@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "apps/api"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+markers = [
+    "network: tests that perform real outbound HTTP requests (require internet access)",
+    "live_llm: tests that require a running Ollama server with the qwen2.5:0.5b model (deselected by default; run with `pytest -m live_llm`)",
+]
+addopts = "-v --tb=short --strict-markers"

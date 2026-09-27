@@ -1,0 +1,69 @@
+# ─── Secrets & environment ────────────────────────────────────────────────
+# Real credentials live here; only *.example templates are tracked.
+.env
+.env.*
+!.env.example
+apps/web/.env
+apps/web/.env.*
+!apps/web/.env.example
+
+# ─── Databases & runtime state ────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+raivisox_live.db
+apps/api/raivisox_live_test.db
+
+# ─── Task workspaces (generated pipeline output) ──────────────────────────
+workspaces/
+apps/api/workspaces/
+apps/web/workspaces/
+
+# ─── Verification/runtime debris from manual harness runs ─────────────────
+*.json.tmp
+exec*.json
+exec2.json
+live2.json
+live3.json
+reg.json
+steps.json
+exA.json
+exB.json
+exec_fin.json
+_bench_artifacts/
+_benchmark_results.json
+_openapi_*.json
+uvicorn.log
+*.log
+
+# ─── Exported bundles (generated) ─────────────────────────────────────────
+*.zip
+
+# ─── Python caches ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ─── Node / Next.js ───────────────────────────────────────────────────────
+node_modules/
+.next/
+tsconfig.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ─── OS / editor noise ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
+
+# ─── Tooling / agent state (machine-local) ────────────────────────────────
+.freebuff/

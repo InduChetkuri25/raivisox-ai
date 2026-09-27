@@ -1,0 +1,109 @@
+# RAIVISOX AI — PRODUCTION compose stack
+#
+#   cp .env.example .env    # fill in every ${VAR:?} below, then:
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Required .env variables (startup FAILS otherwise — by design):
+#   SECRET_KEY            openssl rand -hex 32
+#   POSTGRES_PASSWORD     strong password for the bundled PostgreSQL
+#   CORS_ORIGINS          exact frontend origin(s), e.g. https://app.example.com
+#   ALLOWED_HOSTS         public API hostname(s), e.g. api.example.com
+#   NEXT_PUBLIC_API_URL   public API base URL baked into the frontend build,
+#                         e.g. https://api.example.com
+#   RAIVISOX_LLM_BASE_URL OpenAI-compatible endpoint, e.g.
+#                         http://ollama:11434/v1 (enable the ollama profile)
+#                         or https://api.openai.com/v1 with RAIVISOX_LLM_API_KEY
+#
+# Optional profiles:  --profile ollama   (bundled local provider)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: raivisox-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-raivisox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-raivisox}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-raivisox} -d ${POSTGRES_DB:-raivisox}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./apps/api
+    container_name: raivisox-api
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - APP_NAME=RAIVISOX AI API
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-raivisox}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-raivisox}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required — generate with: openssl rand -hex 32}
+      - CORS_ORIGINS=${CORS_ORIGINS:?CORS_ORIGINS is required — exact frontend origin(s)}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS is required — public API hostname(s)}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RAIVISOX_LLM_BASE_URL=${RAIVISOX_LLM_BASE_URL:?RAIVISOX_LLM_BASE_URL is required — e.g. http://ollama:11434/v1 or https://api.openai.com/v1}
+      - RAIVISOX_LLM_MODEL=${RAIVISOX_LLM_MODEL:-qwen2.5:0.5b}
+      - RAIVISOX_LLM_API_KEY=${RAIVISOX_LLM_API_KEY:-}
+      # Optional hosted-provider keys (alternative to an OpenAI-compatible URL):
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      # Artifact storage limits (bytes / counts) — see docs/deployment.md
+      - MAX_ARTIFACT_SIZE_BYTES=${MAX_ARTIFACT_SIZE_BYTES:-52428800}
+      - MAX_ARTIFACTS_PER_TASK=${MAX_ARTIFACTS_PER_TASK:-1000}
+      - MAX_ZIP_SIZE_BYTES=${MAX_ZIP_SIZE_BYTES:-209715200}
+      - MAX_ZIP_FILES=${MAX_ZIP_FILES:-10000}
+      - ARTIFACT_RETENTION_DAYS=${ARTIFACT_RETENTION_DAYS:-0}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Artifact storage (task workspaces) — survives container recreation.
+      - workspace_data:/app/workspaces
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        # Baked into the client bundle at BUILD time — set it in .env.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required — public API base URL, e.g. https://api.example.com}
+    container_name: raivisox-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional local provider: docker compose -f docker-compose.prod.yml \
+  #   --profile ollama up -d --build
+  ollama:
+    image: ollama/ollama:latest
+    container_name: raivisox-ollama
+    profiles: ["ollama"]
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  workspace_data:
+  ollama_data:
