@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from integrations.tools.base import BaseTool, ToolResult, ToolRiskLevel, ToolPermission
+from services.security.path_containment import is_contained
 
 
 class FileWriterTool(BaseTool):
@@ -161,10 +162,11 @@ class FileWriterTool(BaseTool):
             )
 
     def _is_path_allowed(self, path: str) -> bool:
-        """Check if a path is within the allowed directories."""
-        for allowed_dir in self.allowed_directories:
-            allowed_abs = os.path.abspath(allowed_dir)
-            # Check if path starts with allowed directory
-            if path.startswith(allowed_abs + os.sep) or path == allowed_abs:
-                return True
-        return False
+        """Check if a path is within the allowed directories.
+
+        SECURITY (Phase 0): symlink-resolving containment — the path's
+        REAL resolution (``realpath``, case-normalized) must land inside
+        an allowed directory, so a symlink planted under an allowed
+        directory cannot redirect writes outside it.
+        """
+        return any(is_contained(path, d) for d in self.allowed_directories)

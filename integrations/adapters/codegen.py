@@ -29,6 +29,7 @@ from typing import Any
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
 from integrations.tools.file_writer import FileWriterTool
 from services.security.audit_trail import AuditTrail
+from services.security.path_containment import contained_path
 
 _LLM_TIMEOUT_SECONDS = 120.0  # cold-start model load can exceed 30s on CPU
 _LLM_CONNECT_TIMEOUT = 5
@@ -117,10 +118,6 @@ _BLOCKED_CODE_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\b(urllib|requests|http\.client|httpx)\b", "network modules are not allowed"),
     (r"\bopen\s*\(", "file I/O is not allowed"),
 )
-
-
-def _norm(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
 
 
 def _slug(text: str) -> str:
@@ -459,11 +456,10 @@ class CodegenAdapter(ToolAdapter):
     # ------------------------------------------------------------------
 
     def _clamp(self, path: str) -> str | None:
-        candidate = path if os.path.isabs(path) else os.path.join(self.workspace, path)
-        resolved = _norm(candidate)
-        if not resolved.startswith(_norm(self.workspace) + os.sep) and resolved != _norm(self.workspace):
-            return None
-        return candidate
+        # SECURITY (Phase 0): symlink-resolving containment — a link
+        # planted inside the workspace must never redirect generated
+        # module writes outside it.
+        return contained_path(path, self.workspace)
 
     async def run(self, params: dict[str, Any], ctx: AdapterContext) -> AdapterResult:
         started = time.perf_counter()

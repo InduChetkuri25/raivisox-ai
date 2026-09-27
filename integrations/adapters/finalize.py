@@ -21,11 +21,7 @@ from typing import Any
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
 from integrations.tools.file_writer import FileWriterTool
 from services.security.audit_trail import AuditTrail
-
-
-def _norm(path: str) -> str:
-    """Case-normalized absolute path (Windows-safe prefix checks)."""
-    return os.path.normcase(os.path.abspath(path))
+from services.security.path_containment import contained_path
 
 
 class FinalizeAdapter(ToolAdapter):
@@ -54,13 +50,16 @@ class FinalizeAdapter(ToolAdapter):
         os.makedirs(self.workspace, exist_ok=True)
         self._writer = FileWriterTool(allowed_directories=[self.workspace])
 
-    def _clamp(self, path: str) -> str | None:
-        """Resolve a request path against the workspace; None if outside."""
-        candidate = path if os.path.isabs(path) else os.path.join(self.workspace, path)
-        resolved = _norm(candidate)
-        if not resolved.startswith(_norm(self.workspace) + os.sep) and resolved != _norm(self.workspace):
-            return None
-        return candidate
+    def _clamp(self, path: str, scope: str | None = None) -> str | None:
+        """Resolve a request path against the workspace; None if outside.
+
+        SECURITY (Phase 0): symlink-resolving containment. When the write
+        targets a task scope, containment is enforced against THAT scope
+        (matching builtin._clamp and the file tools) — so an absolute
+        client-supplied path into another task's directory is rejected,
+        not merely clamped to the shared root.
+        """
+        return contained_path(path, scope if scope else self.workspace)
 
     async def run(self, params: dict[str, Any], ctx: AdapterContext) -> AdapterResult:
         started = time.perf_counter()
@@ -80,6 +79,7 @@ class FinalizeAdapter(ToolAdapter):
         # context is trusted; client params never choose the scope) so
         # concurrent tasks cannot write into each other's workspace.
         task_id = getattr(ctx, "task_id", None)
+        scope: str | None = None
         if task_id:
             safe = "".join(c for c in str(task_id) if c.isalnum() or c == "-")
             if safe:
@@ -87,7 +87,7 @@ class FinalizeAdapter(ToolAdapter):
                 os.makedirs(scope, exist_ok=True)
                 path = os.path.join(scope, path)
 
-        clamped = self._clamp(path)
+        clamped = self._clamp(path, scope)
         if clamped is None:
             AuditTrail.instance().log(
                 actor_id=ctx.actor_id, action="tool:finalize", resource=path,

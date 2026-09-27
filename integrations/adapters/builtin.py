@@ -21,11 +21,7 @@ from integrations.tools.file_reader import FileReaderTool
 from integrations.tools.file_writer import FileWriterTool
 from services.execution.terminal_sandbox import TerminalSandbox
 from services.security.audit_trail import AuditTrail
-
-
-def _norm(path: str) -> str:
-    """Case-normalized absolute path (Windows-safe prefix checks)."""
-    return os.path.normcase(os.path.abspath(path))
+from services.security.path_containment import contained_path
 
 
 def _task_scope(workspace: str, ctx: AdapterContext | None) -> str:
@@ -64,10 +60,10 @@ class _WorkspaceAdapter(ToolAdapter):
         if scope != self.workspace:
             os.makedirs(scope, exist_ok=True)
         candidate = path if os.path.isabs(path) else os.path.join(scope, path)
-        resolved = _norm(candidate)
-        if not resolved.startswith(_norm(scope) + os.sep) and resolved != _norm(scope):
-            return None
-        return candidate
+        # SECURITY (Phase 0): symlink-resolving containment — a link
+        # planted inside the scope must never redirect reads/writes
+        # outside it. Same decision the file tools enforce at use time.
+        return contained_path(candidate, scope)
 
 
 class FileReadAdapter(_WorkspaceAdapter):
