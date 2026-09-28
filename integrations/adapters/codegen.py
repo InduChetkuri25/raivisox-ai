@@ -28,6 +28,7 @@ from typing import Any
 
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
 from integrations.tools.file_writer import FileWriterTool
+from services.execution.sandbox import ExecutionSandbox, SandboxSpec, build_default_sandbox
 from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
 
@@ -207,11 +208,16 @@ class CodegenAdapter(ToolAdapter):
     # Writes files AND spawns interpreter subprocesses — needs both grants.
     kernel_permissions: list[str] = ["write_files", "execute_code"]
 
-    def __init__(self, workspace: str, smoke_timeout: int = 20):
+    def __init__(self, workspace: str, smoke_timeout: int = 20,
+                 sandbox: ExecutionSandbox | None = None):
         self.workspace = os.path.abspath(workspace)
         os.makedirs(self.workspace, exist_ok=True)
         self._writer = FileWriterTool(allowed_directories=[self.workspace])
         self._smoke_timeout = smoke_timeout
+        # V2 Phase 2: the smoke-run subprocess goes through the
+        # ExecutionSandbox boundary (argv-only, minimal env, timeout,
+        # bounded output) instead of a bare create_subprocess_exec.
+        self._sandbox = sandbox if sandbox is not None else build_default_sandbox()
         self.llm_api_key = (
             os.environ.get("RAIVISOX_LLM_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
@@ -407,50 +413,64 @@ class CodegenAdapter(ToolAdapter):
     async def _solve_probe(
         self, module_stem: str, module_dir: str, timeout: int | None = None
     ) -> dict[str, Any]:
-        """Import the module AND execute solve() in a real subprocess.
+        """Import the module AND execute solve() in a sandboxed subprocess.
 
-        Runs with stdin severed and a hard timeout, so a hanging module
-        (interactive loop, endless sleep) fails the step instead of
-        hanging the pipeline. Returns the combined real result.
+        V2 Phase 2 (docs/sandbox-design.md §7 phase 3): the spawn goes
+        through the ExecutionSandbox — argv-only, minimal allowlisted env
+        (no API-process inheritance), cwd contained in the module
+        directory, bounded output, hard timeout with tree kill. A hanging
+        module (interactive loop, endless sleep) fails the step instead of
+        hanging the pipeline. A sandbox failure is an honest failure — the
+        probe is NEVER run unsandboxed as a fallback.
         """
+        # Phase 0 containment: the module directory must resolve inside
+        # this adapter's workspace (a symlinked module dir pointing
+        # outside is rejected before any process exists).
+        if not contained_path(module_dir, self.workspace):
+            return {"ran": False, "exit_code": None, "stdout": "",
+                    "stderr": "sandbox rejected spec: module directory "
+                              "outside workspace",
+                    "mode": "solve_probe", "sandbox_enforced": []}
         probe_code = (
             f"import json, {module_stem}\n"
             f"f = getattr({module_stem}, 'solve', None)\n"
             f"print(json.dumps(f()) if callable(f) else 'no-solve')\n"
         )
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", probe_code,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=module_dir,
-            )
-        except Exception as exc:
-            return {"ran": False, "exit_code": None, "stdout": "",
-                    "stderr": f"spawn failed: {exc}", "mode": "solve_probe"}
         effective_timeout = timeout or self._smoke_timeout
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=effective_timeout
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        spec = SandboxSpec(
+            argv=[sys.executable, "-c", probe_code],
+            cwd=module_dir,
+            env={},  # sandbox builds the minimal allowlisted env
+            timeout_s=float(effective_timeout),
+            # Generous but bounded: stdout[:2000] is taken downstream, and
+            # heavy stdout must not crowd out the probe's own result line
+            # before that truncation (pre-sandbox capture was unbounded).
+            output_limit_bytes=2_000_000,
+            workspace_writable=module_dir,
+        )
+        result = await self._sandbox.run(spec)
+        if result.killed_reason == "timeout":
             return {
                 "ran": True, "exit_code": None, "stdout": "",
                 "stderr": f"solve probe timed out after {effective_timeout}s "
                           "(hanging module)",
                 "mode": "solve_probe",
+                "sandbox_enforced": result.enforced,
             }
-        out_text = stdout.decode(errors="replace")[:2000]
+        if result.error is not None:
+            # Sandbox/spawn failure: honest failure, no unsandboxed retry.
+            return {"ran": False, "exit_code": None, "stdout": "",
+                    "stderr": result.error, "mode": "solve_probe",
+                    "sandbox_enforced": result.enforced}
+        out_text = result.stdout[:2000]
         return {
             "ran": True,
-            "exit_code": proc.returncode,
+            "exit_code": result.exit_code,
             "stdout": out_text,
-            "stderr": stderr.decode(errors="replace")[:2000],
+            "stderr": result.stderr[:2000],
             "solve_present": out_text.strip() != "no-solve",
             "mode": "solve_probe",
+            "sandbox_enforced": result.enforced,
         }
 
     # ------------------------------------------------------------------
@@ -596,7 +616,12 @@ class CodegenAdapter(ToolAdapter):
         problems = []
         if not compile_ok:
             problems.append(compile_err)
-        if smoke.get("ran") and smoke.get("exit_code") != 0:
+        if not smoke.get("ran"):
+            # Sandbox/spawn failure — honest failure; never silently treat
+            # an unverified module as generated, and NEVER fall back to an
+            # unsandboxed probe.
+            problems.append(f"sandbox unavailable: {smoke.get('stderr', '')[:300]}")
+        elif smoke.get("exit_code") != 0:
             problems.append(f"solve probe failed: {smoke.get('stderr', '')[:300]}")
         if problems:
             return _done(False, output=output, error="; ".join(problems))

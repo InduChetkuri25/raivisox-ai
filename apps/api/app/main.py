@@ -51,7 +51,7 @@ from app.models.task_event import EventType
 from services.intent.engine import get_intent_engine
 from services.decomposer.decomposer import get_task_decomposer
 from services.dod.dod import get_dod_generator
-from services.dod.dod_checks import run_module_checks as run_dod_checks
+from services.dod.dod_checks import run_module_checks_async as run_dod_checks_async
 from services.dod.dod_checks import summarize as summarize_dod
 from services.planner.planner import get_planner
 from services.router.router import get_router
@@ -2810,10 +2810,13 @@ async def run_task_pipeline(
             and node.result["output"].get("written_to")
         ]
         dod_module_results = [
-            run_dod_checks(
+            await run_dod_checks_async(
                 goal=task.goal or task.title or "",
                 module_path=artifact,
                 override_return=fail_dod_with,
+                # Phase 0 containment: reject module dirs that resolve
+                # outside the task workspace before spawning anything.
+                workspace_root=TASK_WORKSPACE,
             )
             for artifact in artifacts
         ]

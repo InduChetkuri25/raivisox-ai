@@ -17,15 +17,22 @@ Honesty contract:
 """
 
 import ast
+import asyncio
 import json
 import math
 import operator
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Any
+
+from services.execution.sandbox import (
+    ExecutionSandbox,
+    SandboxSpec,
+    build_default_sandbox,
+)
+from services.security.path_containment import contained_path
 
 # Binary operators we can safely evaluate for expectation expressions.
 _BIN_OPS = {
@@ -78,6 +85,9 @@ class DoDCheckResult:
     checks: list[dict[str, Any]] = field(default_factory=list)
     abstained: bool = False         # nothing derivable from the goal
     abstain_reason: str = ""
+    # V2 Phase 2: guarantees the sandbox actually enforced for this probe
+    # (honest reporting — never claimed without being applied).
+    sandbox_enforced: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +99,7 @@ class DoDCheckResult:
             "checks": self.checks,
             "abstained": self.abstained,
             "abstain_reason": self.abstain_reason,
+            "sandbox_enforced": self.sandbox_enforced,
         }
 
 
@@ -223,17 +234,35 @@ def _values_match(actual: Any, expected: Any, goal_text: str | None = None) -> b
     return False
 
 
-def run_module_checks(
+def _execution_failed(result: DoDCheckResult, error: str) -> DoDCheckResult:
+    """Record an honest execution failure (probe never produced a value)."""
+    result.execution_error = error
+    result.checks = [{
+        "id": "execution", "description": "solve() executes",
+        "passed": False, "actual": None, "error": error,
+    }]
+    return result
+
+
+async def run_module_checks_async(
     goal: str,
     module_path: str,
     timeout: int = 20,
     override_return: Any = None,
+    sandbox: ExecutionSandbox | None = None,
+    workspace_root: str | None = None,
 ) -> DoDCheckResult:
     """Derive checks from the goal and run them against the module's solve().
 
-    The module is EXECUTED fresh in a subprocess (its own interpreter,
-    cwd=module dir, stdin severed) and the real return value of solve()
-    is captured — the adapter's own probe result is never trusted.
+    V2 Phase 2 (docs/sandbox-design.md §7 phase 3): the probe is EXECUTED
+    fresh through the ExecutionSandbox boundary — argv-only, minimal
+    allowlisted environment (no API-process inheritance), cwd contained in
+    the module directory, bounded output, hard timeout with tree kill.
+    The real return value of solve() is captured — the adapter's own probe
+    result is never trusted.
+
+    Honesty: sandbox unavailability/spawn failure is an execution failure;
+    the probe is NEVER run unsandboxed as a fallback.
     """
     stem = os.path.splitext(os.path.basename(module_path))[0]
     module_dir = os.path.dirname(os.path.abspath(module_path))
@@ -245,6 +274,14 @@ def run_module_checks(
         result.abstain_reason = "no executable acceptance criteria derivable from the goal"
         return result
 
+    # Phase 0 containment (when the workspace root is known): a symlinked
+    # module directory resolving outside the workspace is rejected before
+    # any process exists. The sandbox re-validates cwd containment itself.
+    if workspace_root is not None and not contained_path(module_dir, workspace_root):
+        return _execution_failed(
+            result, "sandbox rejected spec: module directory outside workspace"
+        )
+
     probe = (
         f"import json, {stem}\n"
         f"f = getattr({stem}, 'solve', None)\n"
@@ -253,54 +290,47 @@ def run_module_checks(
         f"else:\n"
         f"    print(json.dumps({{'__value__': f()}}))\n"
     )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", probe],
-            input=b"", capture_output=True, timeout=timeout, cwd=module_dir,
-        )
-    except subprocess.TimeoutExpired:
-        result.execution_error = f"solve() timed out after {timeout}s"
-        result.checks = [{
-            "id": "execution", "description": "solve() executes",
-            "passed": False, "actual": None, "error": result.execution_error,
-        }]
-        return result
-    except OSError as exc:
-        result.execution_error = f"spawn failed: {exc}"
-        return result
+    spec = SandboxSpec(
+        argv=[sys.executable, "-c", probe],
+        cwd=module_dir,
+        env={},  # sandbox builds the minimal allowlisted env
+        timeout_s=float(timeout),
+        # Generous but bounded capture: the value line is the LAST line of
+        # stdout, so it must survive even a noisy module (the pre-sandbox
+        # path captured unboundedly; 2MB preserves that practical semantic).
+        output_limit_bytes=2_000_000,
+        workspace_writable=module_dir,
+    )
+    sb = sandbox if sandbox is not None else build_default_sandbox()
+    run_result = await sb.run(spec)
 
-    stdout = proc.stdout.decode(errors="replace").strip()
-    if proc.returncode != 0:
-        result.execution_error = (
-            stderr_tail := proc.stderr.decode(errors="replace").strip()[:400]
-        ) or f"exit code {proc.returncode}"
-        result.checks = [{
-            "id": "execution", "description": "solve() executes",
-            "passed": False, "actual": None, "error": result.execution_error,
-        }]
-        return result
+    if run_result.killed_reason == "timeout":
+        return _execution_failed(result, f"solve() timed out after {timeout}s")
+    if run_result.error is not None:
+        # Sandbox/spawn failure — honest failure, no unsandboxed fallback.
+        return _execution_failed(result, run_result.error)
+
+    stdout = run_result.stdout.strip()
+    if run_result.exit_code != 0:
+        return _execution_failed(
+            result,
+            run_result.stderr.strip()[:400] or f"exit code {run_result.exit_code}",
+        )
 
     try:
         payload = json.loads(stdout.splitlines()[-1] if stdout else "{}")
     except (json.JSONDecodeError, IndexError):
-        result.execution_error = f"unparseable solve() output: {stdout[:200]!r}"
-        result.checks = [{
-            "id": "execution", "description": "solve() executes",
-            "passed": False, "actual": None, "error": result.execution_error,
-        }]
-        return result
+        return _execution_failed(
+            result, f"unparseable solve() output: {stdout[:200]!r}"
+        )
 
     if payload.get("__no_solve__"):
-        result.execution_error = "module has no callable solve()"
-        result.checks = [{
-            "id": "execution", "description": "solve() executes",
-            "passed": False, "actual": None, "error": result.execution_error,
-        }]
-        return result
+        return _execution_failed(result, "module has no callable solve()")
 
     # Execution succeeded — record the REAL value.
     result.executed = True
     result.execution_output = payload.get("__value__")
+    result.sandbox_enforced = list(run_result.enforced)
     if override_return is not None:
         # Negative-test hook (tests/live drills only): act as if solve()
         # had produced this value instead. Execution still counts as clean,
@@ -324,6 +354,34 @@ def run_module_checks(
 
     result.satisfied = all(c["passed"] for c in result.checks)
     return result
+
+
+def run_module_checks(
+    goal: str,
+    module_path: str,
+    timeout: int = 20,
+    override_return: Any = None,
+) -> DoDCheckResult:
+    """Synchronous wrapper around the sandboxed DoD verification.
+
+    Preserved for direct/test callers outside an event loop (same result
+    object, same semantics — the probe itself is identical sandboxed
+    execution). Code running inside the API's event loop must await
+    ``run_module_checks_async`` instead.
+    """
+    coro = run_module_checks_async(
+        goal, module_path, timeout=timeout, override_return=override_return
+    )
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    # Called from inside a running loop: execute on a fresh thread's own
+    # loop rather than deadlocking the caller's.
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 def summarize(goal: str, module_results: list[DoDCheckResult]) -> dict[str, Any]:
