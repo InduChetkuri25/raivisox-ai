@@ -412,8 +412,26 @@ def _live_state() -> tuple[bool, str]:
 
 
 _LIVE, _LIVE_REASON = _live_state()
-live = pytest.mark.skipif(
-    not _LIVE, reason=f"live container test skipped: {_LIVE_REASON}")
+
+
+def live(fn=None):
+    """Mark a test as live-container verification and gate it honestly.
+
+    Adds the ``live`` marker (so ``pytest -m live`` selects the set in the
+    CI container gate) and skips with an explicit reason when no runtime
+    AND image exist on the host. Skipped tests are never passes.
+    """
+    marks = [pytest.mark.live]
+    if not _LIVE:
+        marks.append(pytest.mark.skip(
+            reason=f"live container test skipped: {_LIVE_REASON}"))
+
+    def _deco(f):
+        for m in reversed(marks):
+            f = m(f)
+        return f
+
+    return _deco(fn) if fn is not None else _deco
 
 
 @live

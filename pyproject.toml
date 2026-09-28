@@ -8,5 +8,6 @@ asyncio_mode = "auto"
 markers = [
     "network: tests that perform real outbound HTTP requests (require internet access)",
     "live_llm: tests that require a running Ollama server with the qwen2.5:0.5b model (deselected by default; run with `pytest -m live_llm`)",
+    "live: tests that require a real container runtime and image (Phase 4 live container verification; auto-skip with an explicit reason without one; the CI container gate job runs them with `-m live`)",
 ]
 addopts = "-v --tb=short --strict-markers"

@@ -404,10 +404,33 @@ sandbox is additive capability, never a forced rewrite.
   `--read-only` + non-root `--user`; explicit environment only; argv never
   joined into a shell string) — `tests/unit/test_sandbox_phase4.py`.
 - **NOT verified here:** live container execution. The `test_live_*` tests
-  run only where a runtime **and** the configured image exist, and skip
-  with an explicit reason otherwise. A live container result is never
-  faked, and the existence of Dockerfiles elsewhere in this repo is not
-  evidence of Docker production readiness.
+  and the real-application container-path tests
+  (`tests/unit/test_container_app_path.py`, marked `live`) run only where a
+  runtime **and** the configured image exist, and skip with an explicit
+  reason otherwise. A live container result is never faked, and the
+  existence of Dockerfiles elsewhere in this repo is not evidence of
+  Docker production readiness.
+
+**Local Windows vs Linux CI (authoritative split):**
+
+- **LOCAL WINDOWS (development host):** no Docker, no Podman, and WSL is
+  not installed, so no Windows container runtime can exist here. The local
+  runs verify the fail-closed unavailable path and every command
+  construction rule; the live tests **skip locally with an explicit
+  reason** — a local skip is never represented as a live pass.
+- **LINUX CI (`.github/workflows/ci.yml`, job `container-gate`):** the
+  authoritative live-container verification. The job proves the runtime is
+  installed and usable (version output, `docker info`, a real `docker run
+  --rm … true`), pulls `SANDBOX_CONTAINER_IMAGE`, then runs
+  `pytest … -m live -rs` over both live suites with `SANDBOX_BACKEND=container`:
+  any skip or zero-passed outcome FAILS the gate (a runtime was already
+  proven, so a skip can only mean the gate is broken), and the real
+  RAIVISOX paths (python_exec, shell_exec, codegen/DoD through the
+  kernel-gated registry → ContainerSandbox → SandboxResult → result/
+  artifact evidence → honest success/failure) execute inside actual
+  containers. The normal `backend-tests` job stays independent and keeps
+  the process backend as the default (`SANDBOX_BACKEND=process` sanity
+  step); the container gate never weakens security flags to pass.
 - Unresolved question 3 (fail closed vs. fail documented) is answered as:
   an **invalid** `SANDBOX_BACKEND` value raises loudly at construction; a
   **valid but unavailable** backend fails each execution honestly (§5 row
