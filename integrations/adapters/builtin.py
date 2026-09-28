@@ -19,6 +19,7 @@ from typing import Any
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
 from integrations.tools.file_reader import FileReaderTool
 from integrations.tools.file_writer import FileWriterTool
+from services.execution.sandbox import ExecutionSandbox, SandboxSpec, build_default_sandbox
 from services.execution.terminal_sandbox import TerminalSandbox
 from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
@@ -214,64 +215,79 @@ class ShellExecAdapter(ToolAdapter):
 
 
 class PythonExecAdapter(ToolAdapter):
-    """Execute real Python code in a subprocess with a hard timeout.
+    """Execute real Python code through the ExecutionSandbox boundary.
 
-    Runs the current interpreter with an empty stdin and a timeout.
-    This is real code execution — gated behind the kernel's
-    execute_code permission.
+    V2 Phase 1 (docs/sandbox-design.md §7 phase 2): the spawn goes through
+    the process-backed ExecutionSandbox instead of a bare
+    create_subprocess_exec. The sandbox provides argv execution, an
+    explicit minimal environment (the child no longer inherits the API
+    process environment), the task-scope working directory, bounded output,
+    and the hard timeout with process-tree kill — and reports honestly
+    which guarantees it could actually enforce on this host.
+
+    Still real code execution, still gated behind the kernel's
+    execute_code permission; kernel authorization, workspace clamping,
+    artifacts, audit, and outcomes are unchanged.
     """
 
     id = "python_exec"
-    description = "Run Python code in a subprocess (hard timeout, real execution)"
+    description = "Run Python code in a sandboxed subprocess (argv exec, minimal env, hard timeout)"
     kernel_permissions = ["execute_code"]
 
-    def __init__(self, workspace: str, timeout: int = 20):
+    def __init__(self, workspace: str, timeout: int = 20,
+                 sandbox: ExecutionSandbox | None = None):
         self._workspace = os.path.abspath(workspace)
         self._timeout = timeout
+        self._sandbox = sandbox if sandbox is not None else build_default_sandbox()
         os.makedirs(self._workspace, exist_ok=True)
 
     async def run(self, params: dict[str, Any], ctx: AdapterContext) -> AdapterResult:
         code = params.get("code")
         if not code or not isinstance(code, str):
             return AdapterResult(success=False, tool_id=self.id, error="Missing 'code' parameter")
-        import time
-        start = time.time()
         # Per-task cwd: untrusted code runs inside THIS task's scope
         # directory only. It can still open absolute paths by design (that
         # is real execution), but relative writes cannot cross task scopes.
         scope = _task_scope(self._workspace, ctx)
         if scope != self._workspace:
             os.makedirs(scope, exist_ok=True)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", code,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=scope,
-            )
-        except Exception as e:
-            return AdapterResult(success=False, tool_id=self.id, error=f"spawn failed: {e}")
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self._timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        spec = SandboxSpec(
+            argv=[sys.executable, "-c", code],
+            cwd=scope,
+            env={},  # sandbox builds the minimal allowlisted env — no inheritance
+            timeout_s=float(self._timeout),
+            workspace_writable=scope,
+        )
+        result = await self._sandbox.run(spec)
+        if result.killed_reason == "timeout":
             return AdapterResult(
                 success=False, tool_id=self.id,
-                error=f"python_exec timed out after {self._timeout}s",
-                execution_time_ms=int((time.time() - start) * 1000),
+                error=f"python_exec timed out after {int(self._timeout)}s",
+                execution_time_ms=result.duration_ms,
             )
-        ms = int((time.time() - start) * 1000)
-        out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
-        ok = proc.returncode == 0
+        if result.error is not None:
+            # Sandbox/spawn failure — honest failure; NEVER a fallback to
+            # unsandboxed execution.
+            return AdapterResult(
+                success=False, tool_id=self.id,
+                error=result.error,
+                execution_time_ms=result.duration_ms,
+            )
+        ok = result.exit_code == 0
         return AdapterResult(
             success=ok,
             tool_id=self.id,
-            output={"exit_code": proc.returncode, "stdout": out, "stderr": err},
-            error=None if ok else (err.strip() or f"exit code {proc.returncode}"),
-            execution_time_ms=ms,
+            output={
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                # Additive honesty fields from the design (§4): what the
+                # sandbox actually enforced for THIS run, and any limits hit.
+                "sandbox_enforced": result.enforced,
+                "sandbox_limits_hit": result.limits_hit,
+            },
+            error=None if ok else (result.stderr.strip() or f"exit code {result.exit_code}"),
+            execution_time_ms=result.duration_ms,
         )
 
 
