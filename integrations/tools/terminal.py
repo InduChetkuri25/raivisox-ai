@@ -1,11 +1,22 @@
-"""Terminal sandbox tool for executing commands in a sandboxed environment."""
+"""Terminal sandbox tool for executing commands in a sandboxed environment.
 
-import asyncio
+V2 Phase 3: the spawn is routed through the shared ExecutionSandbox
+boundary (argv via the shell-free command resolver, minimal allowlisted
+environment, Phase 0 symlink-safe cwd containment, bounded output,
+timeout tree-kill, no unsandboxed fallback). The command validator and
+blocklist remain an advisory pre-filter, not the boundary. Caller-supplied
+``environment`` keys are passed through the sandbox's allowlist — keys it
+does not allow (i.e. anything that could carry host secrets) are dropped.
+"""
+
 import os
-import subprocess
+import time
 from typing import Any
 
 from integrations.tools.base import BaseTool, ToolResult, ToolRiskLevel, ToolPermission
+from services.execution.sandbox import SandboxSpec, build_default_sandbox
+from services.execution.terminal_sandbox import _PWD_SENTINEL, resolve_command_argv
+from services.security.path_containment import contained_path
 
 
 class TerminalSandboxTool(BaseTool):
@@ -87,6 +98,9 @@ class TerminalSandboxTool(BaseTool):
         # Create sandbox directory
         os.makedirs(self.sandbox_root, exist_ok=True)
 
+        # Shared ExecutionSandbox boundary for every spawn (V2 Phase 3).
+        self._exec_sandbox = build_default_sandbox()
+
     async def execute(self, parameters: dict[str, Any]) -> ToolResult:
         """Execute a command in the sandbox."""
         import time
@@ -105,69 +119,102 @@ class TerminalSandboxTool(BaseTool):
             if validation_error:
                 return ToolResult(success=False, error=validation_error)
 
-            # Resolve working directory
+            # V2 Phase 3: this tool previously spawned commands directly
+            # (naive argv split, os.environ.copy() inheritance, POSIX-only
+            # killpg). It now goes through the same ExecutionSandbox as
+            # every other untrusted spawn — and NEVER falls back to an
+            # unsandboxed execution.
             if not os.path.isabs(working_directory):
                 working_directory = os.path.join(self.sandbox_root, working_directory)
             working_directory = os.path.abspath(working_directory)
 
-            # Ensure working directory exists
+            # Phase 0 containment: resolve symlinks before deciding the
+            # working directory is inside the sandbox root.
+            if not contained_path(working_directory, self.sandbox_root):
+                return ToolResult(
+                    success=False,
+                    error=f"Working directory '{working_directory}' is outside the sandbox root",
+                )
             os.makedirs(working_directory, exist_ok=True)
 
-            # Merge environment
-            env = os.environ.copy()
-            env.update(environment)
-
-            # Execute command
-            process = await asyncio.create_subprocess_exec(
-                *command.split(),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE if capture_output else asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE if capture_output else asyncio.subprocess.DEVNULL,
-                cwd=working_directory,
-                env=env,
-                preexec_fn=os.setsid,  # Create new process group
+            chdir_target, argv, parse_err = resolve_command_argv(
+                command, working_directory
             )
+            if parse_err is not None:
+                return ToolResult(success=False, error=parse_err)
 
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=timeout,
+            execution_time = int((time.time() - start_time) * 1000)
+
+            if chdir_target == _PWD_SENTINEL:  # pwd / bare cd: no process
+                return ToolResult(
+                    success=True,
+                    output={
+                        "command": command,
+                        "exit_code": 0,
+                        "stdout": working_directory + "\n",
+                        "stderr": "",
+                        "duration_ms": execution_time,
+                        "success": True,
+                    },
+                    execution_time_ms=execution_time,
                 )
-            except asyncio.TimeoutError:
-                # Kill the process group
-                try:
-                    os.killpg(os.getpgid(process.pid), 9)  # SIGKILL
-                except (ProcessLookupError, OSError):
-                    pass
-                await process.wait()
+            if chdir_target is not None:  # validated `cd <dir>`: fresh-process no-op
+                return ToolResult(
+                    success=True,
+                    output={
+                        "command": command,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "duration_ms": execution_time,
+                        "success": True,
+                    },
+                    execution_time_ms=execution_time,
+                )
 
-                execution_time = int((time.time() - start_time) * 1000)
+            spec = SandboxSpec(
+                argv=argv,
+                cwd=working_directory,
+                # Caller env keys go through the sandbox allowlist; anything
+                # not allowlisted (host secrets) is dropped by the sandbox.
+                env={str(k): str(v) for k, v in (environment or {}).items()},
+                timeout_s=float(timeout),
+                workspace_writable=working_directory,
+            )
+            result = await self._exec_sandbox.run(spec)
+
+            execution_time = int((time.time() - start_time) * 1000)
+
+            if result.killed_reason == "timeout":
                 return ToolResult(
                     success=False,
                     output={
                         "command": command,
                         "exit_code": -1,
-                        "stdout": stdout.decode('utf-8', errors='replace') if stdout else "",
-                        "stderr": stderr.decode('utf-8', errors='replace') + "\n[Command timed out after {}s]".format(timeout),
+                        "stdout": result.stdout,
+                        "stderr": result.stderr
+                        + f"\n[Command timed out after {timeout}s]",
                         "duration_ms": execution_time,
                         "success": False,
                     },
                     execution_time_ms=execution_time,
                 )
+            if result.error is not None:
+                # Sandbox/spawn failure — honest failure; never unsandboxed.
+                return ToolResult(
+                    success=False,
+                    error=result.error,
+                    execution_time_ms=execution_time,
+                )
 
-            execution_time = int((time.time() - start_time) * 1000)
-
-            stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
-            stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
-            exit_code = process.returncode
-
+            exit_code = result.exit_code
             return ToolResult(
                 success=exit_code == 0,
                 output={
                     "command": command,
                     "exit_code": exit_code,
-                    "stdout": stdout_text,
-                    "stderr": stderr_text,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
                     "duration_ms": execution_time,
                     "success": exit_code == 0,
                 },

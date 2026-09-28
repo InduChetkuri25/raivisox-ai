@@ -151,11 +151,17 @@ class FileWriteAdapter(_WorkspaceAdapter):
 
 
 class ShellExecAdapter(ToolAdapter):
-    """Execute a shell command via the portable TerminalSandbox.
+    """Execute a command via TerminalSandbox — argv through ExecutionSandbox.
 
-    Real execution with a command blocklist, optional allowlist, and a
-    hard timeout. The default allowlist restricts commands to safe,
-    read-only inspection utilities unless a wider list is provided.
+    V2 Phase 3 (docs/sandbox-design.md §7 phase 4): no shell is ever
+    spawned. Legacy command strings are parsed into explicit argv (shell
+    builtins emulated deterministically; external programs resolved to
+    absolute executable paths), the command blocklist/allowlist remains as
+    the advisory policy pre-filter, and the spawn itself carries argv-only
+    execution, a minimal allowlisted environment (no API-process env
+    inheritance), task-scope cwd containment, bounded output, and the hard
+    timeout with tree kill. A sandbox failure is an honest failure — never
+    an unsandboxed fallback.
     """
 
     id = "shell_exec"
@@ -165,9 +171,15 @@ class ShellExecAdapter(ToolAdapter):
     DEFAULT_ALLOW = ["python", "echo", "dir", "ls", "type", "cat", "head",
                      "tail", "wc", "sort", "findstr", "grep", "cd", "pwd", "whoami"]
 
-    def __init__(self, workspace: str, allowed_commands: list[str] | None = None, timeout: int = 30):
+    def __init__(self, workspace: str, allowed_commands: list[str] | None = None, timeout: int = 30,
+                 exec_sandbox: ExecutionSandbox | None = None):
         self._root_workspace = os.path.abspath(workspace)
-        self._sandbox = TerminalSandbox(working_dir=self._root_workspace)
+        # Shared ExecutionSandbox boundary (injectable for tests).
+        self._exec_sandbox = exec_sandbox if exec_sandbox is not None else build_default_sandbox()
+        # V2 Phase 3: policy allowlist (advisory pre-filter) + argv
+        # resolution + ExecutionSandbox delegation live in TerminalSandbox.
+        self._sandbox = TerminalSandbox(working_dir=self._root_workspace,
+                                        exec_sandbox=self._exec_sandbox)
         for cmd in self.DEFAULT_ALLOW:
             self._sandbox.allow_command(cmd)
         for cmd in (allowed_commands or []):
@@ -211,6 +223,7 @@ class ShellExecAdapter(ToolAdapter):
             },
             error=None if (entry.get("exit_code") == 0 and not blocked_by_tool) else
             (reason if blocked_by_tool else (entry.get("stderr") or f"exit code {entry.get('exit_code')}")),
+            execution_time_ms=entry.get("duration_ms", 0),
         )
 
 
