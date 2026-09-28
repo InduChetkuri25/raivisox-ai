@@ -1,8 +1,10 @@
 # RAIVISOX Execution Sandbox — V2 Design
 
-**Status:** design only — nothing in this document has been implemented.
-Production code, Docker files, the capability kernel, and the database schema
-are intentionally untouched.
+**Status:** V2 phases 0–4 are implemented and committed (see §9 for the
+exact per-phase verification status — including what the container backend
+has and has NOT been verified to do). The capability kernel and the
+database schema remain untouched; no claim in this document is stronger
+than what its tests actually proved on the host that ran them.
 
 **V1 context.** RAIVISOX executes real code (Python, shell) inside its own
 process's privilege level. The application layer provides command
@@ -374,4 +376,39 @@ sandbox is additive capability, never a forced rewrite.
 
 *Baseline this design was derived from: commit `74e2c1d6a99a06b064ef6486f337892818961fb6`
 (tag `v1.0.0`), audit performed against the working tree at HEAD `7227aa4`
-(CI commit). No code, schema, kernel, or Docker changes were made.*
+(CI commit).*
+
+---
+
+## 9. Implementation status (V2)
+
+| V2 phase | Scope | Commit | Verification |
+|---|---|---|---|
+| 0 | symlink-resolving containment (`services/security/path_containment.py`) | `9b7491b` | unit tests |
+| 1 | `ExecutionSandbox` + process backend; `python_exec` migrated | `f95ba8f` | unit tests, host-enforced guarantees |
+| 2 | codegen smoke-run + DoD execution through the sandbox | `364ebe9` | unit tests, host-enforced guarantees |
+| 3 | shell/`TerminalSandbox` argv migration (§7 phase 4); no `create_subprocess_shell` remains in untrusted execution | `31b6196` | unit tests, host-enforced guarantees |
+| 4 | container backend (§7 phase 5) + `SANDBOX_BACKEND` selection | (this commit) | see below — honestly narrower |
+
+**Container backend verification status (never claim more):**
+
+- **Verified on this host (no container runtime present):** backend
+  selection (`SANDBOX_BACKEND=process` default; `container` selects the
+  container backend; anything else raises a configuration error — never a
+  silent fallback), the fail-closed unavailable path (honest
+  `execution environment unavailable` result, canary-proven that no host
+  execution occurred), spec-validation parity with the process backend,
+  and every `docker/podman run` construction rule (exactly one mount — the
+  writable workspace; never the runtime socket; never `--privileged`;
+  never `--network host`; `--cap-drop ALL` + `no-new-privileges` +
+  `--read-only` + non-root `--user`; explicit environment only; argv never
+  joined into a shell string) — `tests/unit/test_sandbox_phase4.py`.
+- **NOT verified here:** live container execution. The `test_live_*` tests
+  run only where a runtime **and** the configured image exist, and skip
+  with an explicit reason otherwise. A live container result is never
+  faked, and the existence of Dockerfiles elsewhere in this repo is not
+  evidence of Docker production readiness.
+- Unresolved question 3 (fail closed vs. fail documented) is answered as:
+  an **invalid** `SANDBOX_BACKEND` value raises loudly at construction; a
+  **valid but unavailable** backend fails each execution honestly (§5 row
+  1) with no process-backend substitution.

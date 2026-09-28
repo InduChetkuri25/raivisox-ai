@@ -1,9 +1,13 @@
 """ExecutionSandbox — the single doorway for untrusted process execution.
 
 V2 Phase 1 of the design in docs/sandbox-design.md: the interface plus a
-platform-aware process backend. This module is the ONLY place in the
+platform-aware process backend. This module and its Phase 4 sibling
+(services/execution/container_sandbox.py) are the ONLY places in the
 codebase allowed to spawn an untrusted child process; every caller must go
 through ``ExecutionSandbox.run`` with an explicit, argv-only ``SandboxSpec``.
+``build_default_sandbox`` selects the backend via ``SANDBOX_BACKEND``
+(process default; container opt-in; invalid values raise — never a silent
+fallback to another backend).
 
 Phase 1 scope (intentionally small):
 - argv execution only — never a shell string
@@ -327,5 +331,22 @@ class ProcessSandbox:
 
 
 def build_default_sandbox() -> ExecutionSandbox:
-    """Factory used by adapters — Phase 1 returns the process backend."""
-    return ProcessSandbox()
+    """Factory used by adapters — backend selected by ``SANDBOX_BACKEND``.
+
+    - ``process`` (default): the Phase 1 :class:`ProcessSandbox`.
+    - ``container``: the Phase 4 ``ContainerSandbox`` (opt-in). It fails
+      honestly at ``run()`` when no container runtime is reachable — the
+      process backend is NEVER silently substituted.
+    - anything else: ``ValueError`` — an invalid backend is a configuration
+      error, not a license to pick another backend.
+    """
+    backend = os.environ.get("SANDBOX_BACKEND", "process").strip().lower()
+    if backend == "process":
+        return ProcessSandbox()
+    if backend == "container":
+        from services.execution.container_sandbox import ContainerSandbox
+
+        return ContainerSandbox()
+    raise ValueError(
+        f"invalid SANDBOX_BACKEND {backend!r}: expected 'process' or 'container'"
+    )
