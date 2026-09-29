@@ -1,9 +1,42 @@
 """Task and project schemas."""
 
+import os
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _relativize_workspace_paths(value: Any) -> Any:
+    """Recursively rewrite absolute paths INSIDE the task workspace to
+    workspace-relative strings for outbound responses.
+
+    Persisted step results legitimately record absolute host paths (the
+    executor needs them), but the server's filesystem layout must never
+    reach a client. Doing this at the response boundary is what makes the
+    guarantee independent of the serializer: JSON escaping hides backslash
+    paths, so a naive string check silently misses Windows leaks.
+    """
+    if isinstance(value, str):
+        if not os.path.isabs(value):
+            return value
+        try:
+            # Lazy import: app.main builds the workspace root and imports
+            # this module, so a module-level import would be circular.
+            from app.main import TASK_WORKSPACE
+
+            root = os.path.realpath(TASK_WORKSPACE)
+            resolved = os.path.realpath(value)
+            if resolved.startswith(root + os.sep):
+                return os.path.relpath(resolved, root)
+        except Exception:  # noqa: BLE001 — display-only transformation
+            return value
+        return value
+    if isinstance(value, dict):
+        return {k: _relativize_workspace_paths(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_relativize_workspace_paths(v) for v in value]
+    return value
 
 # Import enums from models to avoid duplication
 from app.models.task import TaskStatus, ExecutionMode, RiskLevel
@@ -77,6 +110,11 @@ class TaskStepResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @field_validator("result", "error", mode="before")
+    @classmethod
+    def _scrub_paths(cls, value: Any) -> Any:
+        return _relativize_workspace_paths(value)
+
 
 class TaskEventResponse(BaseModel):
     """Schema for task event response."""
@@ -91,6 +129,11 @@ class TaskEventResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def _scrub_paths(cls, value: Any) -> Any:
+        return _relativize_workspace_paths(value)
 
 
 class TaskResponse(BaseModel):
@@ -118,6 +161,11 @@ class TaskResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @field_validator("definition_of_done", "result", "error", mode="before")
+    @classmethod
+    def _scrub_paths(cls, value: Any) -> Any:
+        return _relativize_workspace_paths(value)
 
 
 class TaskListResponse(BaseModel):

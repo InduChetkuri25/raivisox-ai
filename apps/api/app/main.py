@@ -2970,7 +2970,7 @@ async def run_task_pipeline(
         executor.graph.total_duration,
     )
 
-    return {
+    payload = {
         "task_id": task.id,
         "status": task.status,
         "outcome": outcome,
@@ -2992,6 +2992,12 @@ async def run_task_pipeline(
         "observations": observations.summary(),
         "total_duration": executor.graph.total_duration,
     }
+    # Response boundary: persisted results legitimately hold absolute
+    # workspace paths, but a client must never receive the server's
+    # filesystem layout — relativize before responding.
+    from app.tasks.schemas import _relativize_workspace_paths
+
+    return _relativize_workspace_paths(payload)
 
 
 if __name__ == "__main__":
