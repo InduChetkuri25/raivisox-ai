@@ -58,15 +58,35 @@ jobs:
       # step budget; output is tee'd and uploaded as an artifact even when
       # the job is cancelled so the last started test is always evidence.
       - name: Run full suite (live_llm auto-skipped without Ollama)
+        # Output goes to a FILE, never through a pipe: a lingering child that
+        # inherited stdout can hold a pipe open forever and wedge the step
+        # even after pytest itself exits.  timeout+faulthandler are the
+        # OS-level backstop for a hang inside a C call, where pytest-timeout's
+        # timer thread can never be scheduled; the process listing then shows
+        # any survivor that outlived the run.
         run: |
-          set -o pipefail
-          pytest -q --timeout=120 --timeout-method=thread 2>&1 | tee pytest_full.txt
+          set +e
+          timeout -s ABRT -k 10 900 python -X faulthandler -m pytest \
+            -q --timeout=120 --timeout-method=thread > pytest_full.txt 2>&1
+          rc=$?
+          set -e
+          echo "=== full suite pytest exit: $rc ==="
+          tail -40 pytest_full.txt || true
+          echo "=== surviving processes after pytest ==="
+          ps -eo pid,ppid,etimes,stat,args | grep -v grep | head -40 || true
+          exit $rc
         timeout-minutes: 25
 
       - name: Run non-live-LLM selection explicitly
         run: |
-          set -o pipefail
-          pytest -m "not live_llm" -q --timeout=120 --timeout-method=thread 2>&1 | tee pytest_nonlive.txt
+          set +e
+          timeout -s ABRT -k 10 600 python -X faulthandler -m pytest \
+            -m "not live_llm" -q --timeout=120 --timeout-method=thread > pytest_nonlive.txt 2>&1
+          rc=$?
+          set -e
+          echo "=== non-live pytest exit: $rc ==="
+          tail -40 pytest_nonlive.txt || true
+          exit $rc
         timeout-minutes: 25
 
       - name: Upload pytest diagnostics
@@ -178,10 +198,28 @@ jobs:
 
       - name: Container-backend static/unit tests (non-live half)
         run: |
-          set -o pipefail
-          pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py \
-            -m "not live" -q --timeout=120 --timeout-method=thread 2>&1 | tee container_nonlive_results.txt
+          set +e
+          timeout -s ABRT -k 10 420 python -X faulthandler -m pytest \
+            tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py \
+            -m "not live" -q --timeout=120 --timeout-method=thread > container_nonlive_results.txt 2>&1
+          rc=$?
+          set -e
+          echo "=== non-live container pytest exit: $rc ==="
+          tail -40 container_nonlive_results.txt || true
+          echo "=== surviving processes after pytest ==="
+          ps -eo pid,ppid,etimes,stat,args | grep -v grep | head -40 || true
+          exit $rc
         timeout-minutes: 10
+
+      - name: Upload container gate diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-gate-diagnostics
+          path: |
+            live_container_results.txt
+            container_nonlive_results.txt
+          if-no-files-found: ignore
 
       - name: Clean up CI test database
         if: always()
