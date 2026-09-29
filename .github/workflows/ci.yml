@@ -42,6 +42,7 @@ jobs:
           # SQLite async driver and email validation used by tests but not in
           # requirements.txt.
           pip install "pytest>=8.0.0" "pytest-asyncio>=0.23.0" "pytest-cov>=4.0.0" \
+            "pytest-timeout>=2.3.0" \
             "httpx>=0.27.0" "aiosqlite>=0.20.0" "email-validator>=2.0.0"
 
       - name: Backend selection sanity (default stays the process backend)
@@ -52,13 +53,29 @@ jobs:
           ProcessSandbox; assert isinstance(build_default_sandbox(),
           ProcessSandbox)"
 
+      # -x + per-test timeouts: a single wedged test must fail the job with
+      # a stack dump (thread method) instead of silently eating the whole
+      # step budget; output is tee'd and uploaded as an artifact even when
+      # the job is cancelled so the last started test is always evidence.
       - name: Run full suite (live_llm auto-skipped without Ollama)
-        run: pytest -q
+        run: |
+          set -o pipefail
+          pytest -q -x --timeout=120 --timeout-method=thread 2>&1 | tee pytest_full.txt
         timeout-minutes: 25
 
       - name: Run non-live-LLM selection explicitly
-        run: pytest -m "not live_llm" -q
+        run: |
+          set -o pipefail
+          pytest -m "not live_llm" -q --timeout=120 --timeout-method=thread 2>&1 | tee pytest_nonlive.txt
         timeout-minutes: 25
+
+      - name: Upload pytest diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-diagnostics
+          path: pytest_*.txt
+          if-no-files-found: ignore
 
       - name: Clean up CI test database
         if: always()
@@ -138,6 +155,7 @@ jobs:
       - name: Install test dependencies
         run: |
           pip install "pytest>=8.0.0" "pytest-asyncio>=0.23.0" "pytest-cov>=4.0.0" \
+            "pytest-timeout>=2.3.0" \
             "httpx>=0.27.0" "aiosqlite>=0.20.0" "email-validator>=2.0.0"
 
       # Authoritative live-container verification (docs/sandbox-design.md §9):
@@ -154,7 +172,7 @@ jobs:
             echo '::error::Live container tests skipped although the runtime was proven usable - treating as gate failure'
             exit 1
           fi
-          grep -qE '[0-9]+ passed' live_container_results.txt 
+          grep -qE '[0-9]+ passed' live_container_results.txt \
             || { echo '::error::no live tests ran'; exit 1; }
         timeout-minutes: 15
 
