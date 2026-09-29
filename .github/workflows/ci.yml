@@ -116,7 +116,7 @@ jobs:
       - name: Run live container tests (-m live; any skip fails the gate)
         run: |
           set -o pipefail
-          pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py \
+          pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py \
             -m live -q -rs | tee live_container_results.txt
           if grep -qE 'skipped|SKIPPED' live_container_results.txt; then
             echo '::error::Live container tests skipped although the runtime was proven usable - treating as gate failure'
@@ -127,7 +127,7 @@ jobs:
         timeout-minutes: 15
 
       - name: Container-backend static/unit tests (non-live half)
-        run: pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py -m "not live" -q
+        run: pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py -m "not live" -q
         timeout-minutes: 10
 
       - name: Clean up CI test database

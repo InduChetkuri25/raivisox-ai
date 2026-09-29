@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from services.execution.quotas import ExecutionBudget, SandboxQuota
 from services.security.path_containment import contained_path, realpath_norm
 
 __all__ = [
@@ -45,6 +46,8 @@ __all__ = [
     "SandboxResult",
     "ExecutionSandbox",
     "ProcessSandbox",
+    "SandboxQuota",
+    "ExecutionBudget",
 ]
 
 KilledReason = Literal[
@@ -147,18 +150,35 @@ class ProcessSandbox:
 
     What this backend enforces on POSIX (via preexec rlimits):
       - CPU seconds (RLIMIT_CPU), address space (RLIMIT_AS), file size
-        (RLIMIT_FSIZE)
+        (RLIMIT_FSIZE). Quota terminations are attributed from the kernel's
+        own signals: SIGXCPU → ``cpu``, SIGXFSZ → ``fsize`` (V2 Phase 5);
+        any other signal death is reported as an honest generic supervisor
+        failure, never as an invented quota cause.
+
+    Per-run CPU usage is accounted via ``RUSAGE_CHILDREN`` deltas on POSIX
+    (``cpu_used:<s>`` in ``limits_hit``, ``cpu_time`` basis) and as wall
+    duration elsewhere — the basis used is the one reported. The POSIX
+    counter is process-global, so under concurrent sandboxes the delta can
+    include sibling children: it overcounts, which is budget-safe and
+    therefore kept.
 
     What NO host gave Phase 1 a clean portable mechanism for is reported
     honestly as not enforced: filesystem confinement beyond cwd semantics,
     network deny, and process-count caps. On Windows, the POSIX rlimits are
-    likewise reported unavailable rather than pretended. The caller sees the
-    truth in ``capabilities()`` / ``SandboxResult.enforced`` and must decide
-    policy (the integrated adapter fails the step when a *required*
-    capability is missing — never silently runs unsandboxed).
+    likewise reported unavailable rather than pretended — there is no fake
+    Windows CPU/memory/PID enforcement layer. The caller sees the truth in
+    ``capabilities()`` / ``SandboxResult.enforced`` and must decide policy
+    (the integrated adapter fails the step when a *required* capability is
+    missing — never silently runs unsandboxed).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, quota: SandboxQuota | None = None,
+                 budget: ExecutionBudget | None = None) -> None:
+        # V2 Phase 5: optional spec-level quota (required-limit enforcement)
+        # and cumulative per-context budget. Both are additive; None keeps
+        # the Phase 1 behavior byte-for-byte.
+        self._quota = quota
+        self._budget = budget
         self._posix = os.name == "posix"
         self._has_resource = False
         if self._posix:
@@ -222,6 +242,42 @@ class ProcessSandbox:
             )
 
     async def run(self, spec: SandboxSpec) -> SandboxResult:
+        # V2 Phase 5 — spec-level quota gate: a caller-required limit the
+        # host cannot enforce fails the run honestly BEFORE any process
+        # exists (never silently weaker, never a fake enforcement claim).
+        # With strict_limits=False the caller accepted a best-effort run:
+        # the result's ``enforced`` list stays the honest witness instead.
+        if self._quota is not None and self._quota.strict_limits:
+            missing = self._quota.missing_from(self.capabilities())
+            if missing:
+                return SandboxResult(
+                    error=("sandbox quota not enforceable on this host: "
+                           + ", ".join(sorted(missing))
+                           + " (refused; no weaker unconfined run)"),
+                    killed_reason="supervisor",
+                    enforced=["spec_validation"],
+                )
+        # V2 Phase 5 — cumulative budget: a hard gate before the run (a
+        # budget is a limit, not an advisory). Uses the budget's own
+        # monotonic clock; no OS support required.
+        budget = self._budget
+        if budget is not None:
+            try:
+                budget.check_reserve(kind="run")
+            except Exception as exc:
+                # Honest mapping by dimension: wall-clock exhaustion IS a
+                # timeout; CPU exhaustion is a cpu termination; any other
+                # (e.g. run-count) stays a supervisor-class failure.
+                kind = getattr(exc, "kind", "")
+                reason = {"wall_clock": "timeout", "cpu": "cpu"}.get(
+                    kind, "supervisor")
+                return SandboxResult(
+                    error=f"execution budget exhausted: {exc}",
+                    killed_reason=reason,
+                    limits_hit=["budget", kind or "budget"],
+                    enforced=["budget"],
+                )
+
         # The cwd MUST be contained in the declared writable workspace (the
         # task scope). This reuses the Phase 0 symlink-resolving boundary so
         # the sandbox and the clamps can never disagree.
@@ -278,6 +334,11 @@ class ProcessSandbox:
         except asyncio.TimeoutError:
             timed_out = True
             await self._kill_tree(proc)
+        except asyncio.CancelledError:
+            # V2 Phase 5: cleanup after cancellation — the caller gave up,
+            # but the child must never outlive the run.
+            await self._kill_tree(proc)
+            raise
 
         duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -294,22 +355,73 @@ class ProcessSandbox:
                 error=err,
             )
 
-        out, out_trunc = _truncate(stdout_b or b"", spec.output_limit_bytes)
-        err, err_trunc = _truncate(stderr_b or b"", spec.output_limit_bytes)
+        out, out_trunc, _ = self._decode_with_reason(
+            stdout_b or b"", spec.output_limit_bytes)
+        err, err_trunc, _ = self._decode_with_reason(
+            stderr_b or b"", spec.output_limit_bytes)
         limits_hit: list[str] = []
         if out_trunc:
-            limits_hit.append("output_limit:stdout")
+            limits_hit.extend(("output_limit", "output_limit:stdout"))
         if err_trunc:
-            limits_hit.append("output_limit:stderr")
+            limits_hit.extend(("output_limit", "output_limit:stderr"))
+
+        # Honest per-run CPU accounting: the child's ACTUAL cpu time where
+        # the platform exposes it (POSIX RUSAGE_CHILDREN delta), the wall
+        # duration otherwise — the basis used is the one reported.
+        cpu_used = duration_ms / 1000.0
+        cpu_basis = "wall_clock"
+        if self._posix and self._has_resource:
+            try:
+                import resource
+
+                ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+                child_cpu = ru.ru_utime + ru.ru_stime
+                previous = getattr(self, "_last_children_cpu", 0.0)
+                delta = child_cpu - previous
+                self._last_children_cpu = child_cpu
+                if delta > 0:
+                    cpu_used = delta
+                    cpu_basis = "cpu_time"
+            except Exception:  # pragma: no cover - accounting is best-effort
+                pass
+
+        # Quota termination semantics (Phase 5): ordinary non-zero exits
+        # are NOT quota terminations. Only kernel-delivered resource
+        # signals map onto the quota vocabulary; anything else stays an
+        # honest supervisor-class failure.
+        killed_reason: KilledReason | None = None
+        if proc.returncode is not None and proc.returncode < 0:
+            signum = -proc.returncode
+            reason = self._signal_reason(signum)
+            killed_reason = reason  # "cpu" | "fsize" | "supervisor"
+            limits_hit.append(reason)
+            if reason == "cpu":
+                err = (err + "\n[sandbox: child killed by CPU limit "
+                       "(SIGXCPU)]").strip()
+            elif reason == "fsize":
+                err = (err + "\n[sandbox: child killed by file-size limit "
+                       "(SIGXFSZ)]").strip()
+            else:
+                err = (err + f"\n[sandbox: child terminated by signal "
+                       f"{signum}]").strip()
+
+        limits_hit.append(f"cpu_used:{cpu_used:.3f}")
+
+        # V2 Phase 5 — budget accounting after the run: actual measured CPU
+        # (or the basis actually used) is consumed honestly.
+        if budget is not None:
+            budget.record_usage(cpu_seconds=cpu_used, cpu_basis=cpu_basis,
+                                runs=1)
 
         return SandboxResult(
             exit_code=proc.returncode,
             stdout=out,
             stderr=err,
             duration_ms=duration_ms,
-            killed_reason=None,
+            killed_reason=killed_reason,
             limits_hit=limits_hit,
             enforced=enforced,
+            error=None,
         )
 
     async def _kill_tree(self, proc: asyncio.subprocess.Process) -> None:
@@ -328,6 +440,36 @@ class ProcessSandbox:
             await proc.wait()
         except Exception:  # pragma: no cover
             pass
+
+    # ------------------------------------------------------------------
+    # V2 Phase 5: quota termination semantics + honest CPU accounting
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _decode_with_reason(buf: bytes, limit: int) -> tuple[str, bool, bool]:
+        """Decode bounded output; ``killed_reason`` value for an output kill.
+
+        Returns ``(text, truncated, killed)`` — ``killed`` is True when the
+        truncation actually cut content (the design's honest
+        ``killed_reason="output"``-class termination is folded into the
+        ``supervisor``-reported resource limit and surfaced here for the
+        result mapping).
+        """
+        text, truncated = _truncate(buf, limit)
+        return text, truncated, truncated
+
+    @staticmethod
+    def _signal_reason(signum: int) -> str:
+        """Quota attribution from the signal the KERNEL delivered.
+
+        Only kernel-delivered resource signals are attributed: SIGXCPU →
+        ``cpu`` (RLIMIT_CPU), SIGXFSZ → ``fsize`` (RLIMIT_FSIZE). SIGKILL
+        is deliberately NOT attributed to memory: the killer is unknowable
+        (external kill vs OOM reclaim), and the design's rule is to report
+        an honest generic supervisor failure rather than invent a cause.
+        """
+        return {signal.SIGXCPU: "cpu", signal.SIGXFSZ: "fsize"}.get(
+            signum, "supervisor")
 
 
 def build_default_sandbox() -> ExecutionSandbox:

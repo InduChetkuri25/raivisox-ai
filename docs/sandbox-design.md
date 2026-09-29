@@ -389,6 +389,7 @@ sandbox is additive capability, never a forced rewrite.
 | 2 | codegen smoke-run + DoD execution through the sandbox | `364ebe9` | unit tests, host-enforced guarantees |
 | 3 | shell/`TerminalSandbox` argv migration (§7 phase 4); no `create_subprocess_shell` remains in untrusted execution | `31b6196` | unit tests, host-enforced guarantees |
 | 4 | container backend (§7 phase 5) + `SANDBOX_BACKEND` selection | (this commit) | see below — honestly narrower |
+| 5 | resource quotas + cumulative execution budgets (§5 vocabulary, §7.6) | (this commit) | quota model/budget/enforcer unit-tested; POSIX SIGXCPU/SIGXFSZ attribution unit-tested on Linux CI; container quota kills (`--memory` OOM → `memory`, `--ulimit cpu/fsize`, `--pids-limit`) are `live`-marked and run in the CI container gate — not live-verified until that job executes |
 
 **Container backend verification status (never claim more):**
 

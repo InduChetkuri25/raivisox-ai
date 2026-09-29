@@ -73,7 +73,9 @@ import time
 import uuid
 
 from services.execution.sandbox import (
+    ExecutionBudget,
     ExecutionSandbox,
+    SandboxQuota,
     SandboxResult,
     SandboxSpec,
     _ALLOWED_ENV_KEYS,
@@ -356,7 +358,13 @@ class ContainerSandbox:
     """
 
     def __init__(self, image: str | None = None, python_bin: str | None = None,
-                 user: str | None = None) -> None:
+                 user: str | None = None,
+                 quota: "SandboxQuota | None" = None,
+                 budget: "ExecutionBudget | None" = None) -> None:
+        # V2 Phase 5: optional spec-level quota + cumulative budget, same
+        # gates as the process backend (additive; None keeps Phase 4 exact).
+        self._quota = quota
+        self._budget = budget
         self._image = (image or os.environ.get("SANDBOX_CONTAINER_IMAGE",
                                                "").strip() or DEFAULT_IMAGE)
         self._python_bin = (python_bin if python_bin is not None
@@ -416,6 +424,39 @@ class ContainerSandbox:
     # -- execution -----------------------------------------------------------
 
     async def run(self, spec: SandboxSpec) -> SandboxResult:
+        # 0) V2 Phase 5 — quota gate: required-but-unenforceable limits
+        #    refuse the run honestly (identical semantics to the process
+        #    backend; a container host cannot silently weaken a caller's
+        #    grant either). strict_limits=False proceeds and lets the
+        #    result's ``enforced`` list stay the honest witness.
+        if self._quota is not None and self._quota.strict_limits:
+            missing = self._quota.missing_from(self.capabilities())
+            if missing:
+                return SandboxResult(
+                    error=("sandbox quota not enforceable on this host: "
+                           + ", ".join(sorted(missing))
+                           + " (refused; no weaker unconfined run)"),
+                    killed_reason="supervisor",
+                    enforced=["spec_validation"],
+                )
+        # 0b) V2 Phase 5 — cumulative budget: hard gate before any runtime
+        #    interaction, honest per-dimension mapping (identical to the
+        #    process backend).
+        budget = self._budget
+        if budget is not None:
+            try:
+                budget.check_reserve(kind="run")
+            except Exception as exc:
+                kind = getattr(exc, "kind", "")
+                reason = {"wall_clock": "timeout", "cpu": "cpu"}.get(
+                    kind, "supervisor")
+                return SandboxResult(
+                    error=f"execution budget exhausted: {exc}",
+                    killed_reason=reason,
+                    limits_hit=["budget", kind or "budget"],
+                    enforced=["budget"],
+                )
+
         # 1) Spec scope validation — identical boundary and wording to
         #    ProcessSandbox, before any runtime interaction.
         container_cwd, err = map_container_cwd(spec)
@@ -460,6 +501,12 @@ class ContainerSandbox:
             try:
                 out_b, err_b, out_cut, err_cut, rc = await self._await_bounded(
                     proc, spec, deadline)
+            except asyncio.CancelledError:
+                # V2 Phase 5: cleanup after cancellation — remove the
+                # container before propagating, so no raivisox-sbx-
+                # container outlives a cancelled run.
+                await self._force_remove(exe, name)
+                raise
             except TimeoutError:
                 # The container must be force-removed: killing the CLI
                 # client alone would leave it running.
@@ -474,6 +521,11 @@ class ContainerSandbox:
                     except (TimeoutError, ProcessLookupError):
                         pass
                 duration_ms = int((time.monotonic() - start) * 1000)
+                # V2 Phase 5 — the timed-out run DID consume budget; the
+                # wall-clock basis is what the host can honestly measure.
+                if budget is not None:
+                    budget.record_usage(cpu_seconds=duration_ms / 1000.0,
+                                        cpu_basis="wall_clock", runs=1)
                 err = f"sandbox: process killed after timeout of {spec.timeout_s}s"
                 return SandboxResult(
                     exit_code=None,
@@ -507,15 +559,41 @@ class ContainerSandbox:
             er, err_trunc = decode_bounded(err_b, err_cut, spec.output_limit_bytes)
             limits_hit: list[str] = []
             if out_trunc:
-                limits_hit.append("output_limit:stdout")
+                limits_hit.extend(("output_limit", "output_limit:stdout"))
             if err_trunc:
-                limits_hit.append("output_limit:stderr")
+                limits_hit.extend(("output_limit", "output_limit:stderr"))
+
+            # Quota attribution (V2 Phase 5): only runtime-attributed codes
+            # map onto the quota vocabulary. 128+7 SIGBUS/128+24 SIGXCPU/
+            # 128+25 SIGXFSZ are kernel resource signals; 137 = OOM-kill
+            # class ONLY when --memory was actually applied this run.
+            # Anything else (126/127 exec failures, ordinary program
+            # exits, unknown kills) stays an honest non-zero exit or a
+            # generic supervisor failure - never an invented quota cause.
+            killed_reason = None
+            if rc in (152, 153, 136):  # 128+24 SIGXCPU, 128+25 SIGXFSZ, 128+8 SIGBUS
+                killed_reason = {152: "cpu", 153: "fsize", 136: "supervisor"}[rc]
+                limits_hit.append(killed_reason)
+                er = (er + f"\n[sandbox: child terminated by resource limit "
+                      f"(exit {rc})]").strip()
+            elif rc == 137 and "memory_limit" in enforced:
+                killed_reason = "memory"
+                limits_hit.append("memory")
+                er = (er + "\n[sandbox: child killed at the memory limit]").strip()
+
+            # V2 Phase 5 — budget accounting after the run. The host cannot
+            # read the container's rusage cheaply, so wall duration is the
+            # honest basis actually used here (recorded as such).
+            if budget is not None:
+                budget.record_usage(cpu_seconds=duration_ms / 1000.0,
+                                    cpu_basis="wall_clock", runs=1)
+
             return SandboxResult(
                 exit_code=rc,
                 stdout=out,
                 stderr=er,
                 duration_ms=duration_ms,
-                killed_reason=None,
+                killed_reason=killed_reason,
                 limits_hit=limits_hit,
                 enforced=enforced,
             )
