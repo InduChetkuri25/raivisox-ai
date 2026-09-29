@@ -99,7 +99,22 @@ async def test_stderr_is_captured(sandbox, workspace):
 
 async def test_child_env_is_minimal_and_allowlisted(sandbox, workspace):
     os.environ["RAIVISOX_RANDOM_UNLISTED"] = "nope"
-    code = "import os, json; print(json.dumps(sorted(os.environ.keys())))"
+    # Measure the environment the OS actually passed at exec, not the child's
+    # os.environ: CPython adds LC_CTYPE to os.environ at startup under locale
+    # coercion (PEP 538), which says nothing about what was inherited. On
+    # POSIX the raw block is /proc/self/environ; elsewhere os.environ is the
+    # only portable view (documented limitation of this probe).
+    code = (
+        "import json, os\n"
+        "p = '/proc/self/environ'\n"
+        "if os.path.exists(p):\n"
+        "    raw = open(p, 'rb').read()\n"
+        "    keys = sorted(e.split(b'=', 1)[0].decode() "
+        "for e in raw.split(b'\\0') if e)\n"
+        "else:\n"
+        "    keys = sorted(os.environ)\n"
+        "print(json.dumps(keys))\n"
+    )
     r = await sandbox.run(_spec(workspace, code))
     assert r.success, r.error
     keys = eval(r.stdout.strip())  # noqa: S307 (test-only, sandbox output)
