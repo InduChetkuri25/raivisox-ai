@@ -119,7 +119,11 @@ class TestInterruptionStage:
         try:
             con.execute(
                 "INSERT INTO task_events (id, task_id, event_type, payload, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))",
+                # +1s: SQLite's datetime('now') has second granularity while
+                # the pipeline's own events carry microseconds, so a plain
+                # 'now' can sort BEFORE the completions it must follow and the
+                # sweep then reports "between steps" (a timing flake).
+                "VALUES (?, ?, ?, ?, datetime('now', '+1 second'), datetime('now', '+1 second'))",
                 (
                     str(uuid.uuid4()),
                     task_id,
