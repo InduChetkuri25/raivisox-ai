@@ -148,7 +148,8 @@ class ProcessSandbox:
       - bounded output capture
       - wall-clock timeout with process-tree kill
 
-    What this backend enforces on POSIX (via preexec rlimits):
+    What this backend enforces on POSIX (rlimits applied by a trusted
+    wrapper-exec before the real program runs):
       - CPU seconds (RLIMIT_CPU), address space (RLIMIT_AS), file size
         (RLIMIT_FSIZE). Quota terminations are attributed from the kernel's
         own signals: SIGXCPU → ``cpu``, SIGXFSZ → ``fsize`` (V2 Phase 5);
@@ -226,20 +227,53 @@ class ProcessSandbox:
                 env[key] = val
         return env
 
-    def _preexec(self, spec: SandboxSpec) -> None:  # pragma: no cover (runs in child)
-        """Child-side rlimits (POSIX only). Runs between fork and exec."""
-        import resource
+    def _preexec(self, spec: SandboxSpec) -> None:  # pragma: no cover
+        """Deprecated child-side rlimits hook - superseded by the trusted
+        wrapper-exec below (``_RLIMIT_WRAPPER``/``_wrap_argv_posix``).
+        Retained name only for the capability-reporting history."""
+        raise NotImplementedError("superseded by the rlimit wrapper-exec")
 
+    # ------------------------------------------------------------------
+    # V2 acceptance: preexec-free POSIX rlimit wrapper (trusted argv[0])
+    # ------------------------------------------------------------------
+    # asyncio.create_subprocess_exec(preexec_fn=...) fails to spawn on the
+    # CI runner's CPython 3.12.14 (bare SubprocessError on every exec;
+    # A/B-diagnosed: the same argv spawns fine WITHOUT preexec_fn). Beyond
+    # that specific breakage, preexec_fn is documented fork-unsafe in
+    # threaded processes. The boundary below is the standard alternative:
+    # a generated wrapper re-applies the identical rlimits and os.execv's
+    # the real argv. It is spawned WITHOUT preexec_fn; the executable is
+    # the trusted interpreter's absolute path; the child code is the
+    # embedded constant below; and a wrapper death (e.g. the soft limit
+    # itself) fails the run honestly - there is no unconfined exec path.
+
+    _RLIMIT_WRAPPER = (
+        "import os, resource, sys\n"
+        "limits = []\n"
+        "for token in sys.argv[1].split(','):\n"
+        "    if token:\n"
+        "        name, value = token.split('=')\n"
+        "        limits.append((getattr(resource, name), int(value)))\n"
+        "for res, value in limits:\n"
+        "    resource.setrlimit(res, (value, value))\n"
+        "os.execv(sys.argv[2], sys.argv[2:])\n"
+    )
+
+    def _wrap_argv_posix(self, spec: SandboxSpec) -> list[str]:
+        """POSIX argv with the rlimit wrapper as trusted argv[0]."""
+        limits: list[str] = []
         if spec.cpu_seconds is not None:
-            resource.setrlimit(resource.RLIMIT_CPU, (spec.cpu_seconds, spec.cpu_seconds))
+            limits.append(f"RLIMIT_CPU={spec.cpu_seconds}")
         if spec.memory_bytes is not None:
-            resource.setrlimit(
-                resource.RLIMIT_AS, (spec.memory_bytes, spec.memory_bytes)
-            )
+            limits.append(f"RLIMIT_AS={spec.memory_bytes}")
         if spec.fsize_bytes is not None:
-            resource.setrlimit(
-                resource.RLIMIT_FSIZE, (spec.fsize_bytes, spec.fsize_bytes)
-            )
+            limits.append(f"RLIMIT_FSIZE={spec.fsize_bytes}")
+        if not limits:
+            return list(spec.argv)
+        return [
+            sys.executable, "-c", self._RLIMIT_WRAPPER,
+            ",".join(limits), spec.argv[0], *spec.argv[1:],
+        ]
 
     async def run(self, spec: SandboxSpec) -> SandboxResult:
         # V2 Phase 5 — spec-level quota gate: a caller-required limit the
@@ -309,14 +343,15 @@ class ProcessSandbox:
 
         start = time.monotonic()
         try:
+            spawn_argv = (self._wrap_argv_posix(spec)
+                          if (self._posix and self._has_resource) else list(spec.argv))
             proc = await asyncio.create_subprocess_exec(
-                *spec.argv,
+                *spawn_argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=spec.cwd,
                 env=env,
-                preexec_fn=self._preexec if (self._posix and self._has_resource) else None,
             )
         except Exception as e:  # spawn failure — honest failure, no fallback
             # Include the message: subprocess wraps the child-side exec

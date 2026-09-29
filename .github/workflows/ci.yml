@@ -97,7 +97,7 @@ jobs:
       - name: Diagnose host spawn with/without preexec_fn (A/B evidence)
         run: |
           python - <<'PY'
-          import asyncio, sys, os, resource
+          import asyncio, sys, os
 
           def preexec():
               pass
@@ -115,8 +115,7 @@ jobs:
 
           async def main():
               print("python", sys.version)
-              print("posix", os.name == "posix", "has_resource",
-                    __import__("importlib.util", fromlist=["util"]).util.find_spec("resource") is not None)
+              print("posix", os.name == "posix")
               await try_spawn("plain")
               await try_spawn("preexec_noop", preexec_fn=preexec)
               await try_spawn("cwd_tmp", cwd="/tmp")
