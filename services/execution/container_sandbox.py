@@ -92,6 +92,7 @@ __all__ = [
     "build_run_argv",
     "read_bounded",
     "decode_bounded",
+    "quota_reason_from_exit",
 ]
 
 # Fixed in-container mount point for the single host bind (the writable
@@ -338,6 +339,51 @@ async def read_bounded(stream: asyncio.StreamReader | None,
     return bytes(buf), overflow
 
 
+def quota_reason_from_exit(rc: int, enforced: list[str],
+                           stderr: str) -> tuple[str | None, str | None]:
+    """Honest quota attribution from a container exit code (V2 Phase 5).
+
+    Returns ``(killed_reason, stderr_suffix)``. Only runtime-attributed or
+    provable causes are claimed:
+
+    - 152 (128+24 SIGXCPU) → ``cpu``; 153 (128+25 SIGXFSZ) → ``fsize``;
+      136 (128+8 SIGBUS) → ``supervisor`` (kernel resource signal,
+      exact limit unknown).
+    - 137 = SIGKILL: attributed to ``memory`` ONLY when ``--memory`` was
+      enforced that run; attributed to ``cpu`` ONLY when the CPU ulimit
+      was enforced AND no memory limit existed (OOM impossible - the
+      only configured killer was the cpu hard limit); with BOTH enforced
+      the cause is genuinely ambiguous → ``supervisor`` (never guess).
+    - exit 1 with EFBIG/'File too large' in stderr while fsize was
+      enforced → ``fsize`` (CPython ignores SIGXFSZ; the child's own
+      error text is the evidence).
+    - Anything else → ``None`` (ordinary exit; never a quota claim).
+    """
+    has_mem = "memory_limit" in enforced
+    has_cpu = "cpu_limit" in enforced
+    if rc == 152:
+        return "cpu", "[sandbox: child terminated by the CPU limit (SIGXCPU)]"
+    if rc == 153:
+        return "fsize", "[sandbox: child terminated by the file-size limit (SIGXFSZ)]"
+    if rc == 136:
+        return "supervisor", None
+    if rc == 137:
+        if has_mem and not has_cpu:
+            return "memory", "[sandbox: child killed at the memory limit]"
+        if has_cpu and not has_mem:
+            return "cpu", "[sandbox: child killed at the CPU hard limit]"
+        if has_mem and has_cpu:
+            return ("supervisor",
+                    "[sandbox: child SIGKILLed; cpu/memory limits both "
+                    "enforced - cause not attributable]")
+        return None, None
+    if (rc not in (0, None) and "fsize_limit" in enforced
+            and ("EFBIG" in stderr or "File too large" in stderr)):
+        return ("fsize",
+                "[sandbox: child blocked by the file-size limit]")
+    return None, None
+
+
 def decode_bounded(buf: bytes, overflow: bool, limit: int) -> tuple[str, bool]:
     """Decode a bounded buffer; append the standard truncation marker when cut."""
     s = buf.decode(errors="replace")
@@ -567,32 +613,14 @@ class ContainerSandbox:
             if err_trunc:
                 limits_hit.extend(("output_limit", "output_limit:stderr"))
 
-            # Quota attribution (V2 Phase 5): only runtime-attributed codes
-            # map onto the quota vocabulary. 128+7 SIGBUS/128+24 SIGXCPU/
-            # 128+25 SIGXFSZ are kernel resource signals; 137 = OOM-kill
-            # class ONLY when --memory was actually applied this run.
-            # Anything else (126/127 exec failures, ordinary program
-            # exits, unknown kills) stays an honest non-zero exit or a
-            # generic supervisor failure - never an invented quota cause.
-            killed_reason = None
-            if rc in (152, 153, 136):  # 128+24 SIGXCPU, 128+25 SIGXFSZ, 128+8 SIGBUS
-                killed_reason = {152: "cpu", 153: "fsize", 136: "supervisor"}[rc]
+            # Quota attribution (V2 Phase 5) - see quota_reason_from_exit:
+            # only runtime-attributed or provable causes are claimed;
+            # ambiguous SIGKILLs stay honest supervisor failures.
+            killed_reason, suffix = quota_reason_from_exit(rc, enforced, er)
+            if killed_reason is not None:
                 limits_hit.append(killed_reason)
-                er = (er + f"\n[sandbox: child terminated by resource limit "
-                      f"(exit {rc})]").strip()
-            elif rc == 137 and "memory_limit" in enforced:
-                killed_reason = "memory"
-                limits_hit.append("memory")
-                er = (er + "\n[sandbox: child killed at the memory limit]").strip()
-            elif (rc not in (0, None) and "fsize_limit" in enforced
-                  and ("EFBIG" in er or "File too large" in er)):
-                # CPython ignores SIGXFSZ, so a too-large write fails with a
-                # Python OSError (EFBIG) and exit 1 instead of signal death
-                # 153. The child's own error text names the cause - honest
-                # evidence-based attribution, not invention.
-                killed_reason = "fsize"
-                limits_hit.append("fsize")
-                er = (er + "\n[sandbox: child blocked by the file-size limit]").strip()
+                if suffix:
+                    er = (er + "\n" + suffix).strip()
 
             # V2 Phase 5 — budget accounting after the run. The host cannot
             # read the container's rusage cheaply, so wall duration is the

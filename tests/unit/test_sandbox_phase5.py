@@ -352,6 +352,30 @@ def live(fn=None):
     return _deco(fn) if fn is not None else _deco
 
 
+def test_quota_reason_truth_table_static():
+    """The attribution table is honest by construction (no runtime needed):
+    claims exist only where the runtime evidence is unambiguous."""
+    from services.execution.container_sandbox import quota_reason_from_exit
+
+    assert quota_reason_from_exit(152, ["cpu_limit"], "")[0] == "cpu"
+    assert quota_reason_from_exit(153, ["fsize_limit"], "")[0] == "fsize"
+    assert quota_reason_from_exit(136, ["cpu_limit"], "")[0] == "supervisor"
+    # 137 disambiguation: attribution requires exactly one killer
+    assert quota_reason_from_exit(137, ["memory_limit"], "")[0] == "memory"
+    assert quota_reason_from_exit(137, ["cpu_limit"], "")[0] == "cpu"
+    assert quota_reason_from_exit(137, ["memory_limit", "cpu_limit"], "")[0] \
+        == "supervisor"
+    assert quota_reason_from_exit(137, [], "")[0] is None
+    # EFBIG attribution only when fsize was enforced
+    assert quota_reason_from_exit(1, ["fsize_limit"], "OSError: EFBIG")[0] \
+        == "fsize"
+    assert quota_reason_from_exit(1, [], "OSError: EFBIG")[0] is None
+    # ordinary exits are never quota claims
+    for code in (0, 1, 2, 42, 126, 127):
+        assert quota_reason_from_exit(code, ["memory_limit", "cpu_limit",
+                                             "fsize_limit"], "")[0] is None
+
+
 @live
 async def test_live_container_memory_limit_kills_with_memory_reason(tmp_path):
     """QUOTA TERMINATION, attributed only because --memory was applied."""
