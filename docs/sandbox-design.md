@@ -1,6 +1,6 @@
 # RAIVISOX Execution Sandbox — V2 Design
 
-**Status:** V2 phases 0–4 are implemented and committed (see §9 for the
+**Status:** V2 phases 0–5 are implemented and committed (see §9 for the
 exact per-phase verification status — including what the container backend
 has and has NOT been verified to do). The capability kernel and the
 database schema remain untouched; no claim in this document is stronger
@@ -388,8 +388,8 @@ sandbox is additive capability, never a forced rewrite.
 | 1 | `ExecutionSandbox` + process backend; `python_exec` migrated | `f95ba8f` | unit tests, host-enforced guarantees |
 | 2 | codegen smoke-run + DoD execution through the sandbox | `364ebe9` | unit tests, host-enforced guarantees |
 | 3 | shell/`TerminalSandbox` argv migration (§7 phase 4); no `create_subprocess_shell` remains in untrusted execution | `31b6196` | unit tests, host-enforced guarantees |
-| 4 | container backend (§7 phase 5) + `SANDBOX_BACKEND` selection | (this commit) | see below — honestly narrower |
-| 5 | resource quotas + cumulative execution budgets (§5 vocabulary, §7.6) | (this commit) | quota model/budget/enforcer unit-tested; POSIX SIGXCPU/SIGXFSZ attribution unit-tested on Linux CI; container quota kills (`--memory` OOM → `memory`, `--ulimit cpu/fsize`, `--pids-limit`) are `live`-marked and run in the CI container gate — not live-verified until that job executes |
+| 4 | container backend (§7 phase 5) + `SANDBOX_BACKEND` selection | `9907958` | unit tests + **live** container gate green on Linux CI (see below) |
+| 5 | resource quotas + cumulative execution budgets (§5 vocabulary, §7.6) | `5be77ec` | quota model/budget/enforcer unit-tested on both hosts; **live** container quota kills verified in the Linux CI gate (`memory` OOM, CPU, fsize, pids) and the POSIX process-backend attributions (`cpu` SIGXCPU, `fsize` EFBIG) verified on Linux CI too — see the evidence below |
 
 **Container backend verification status (never claim more):**
 
@@ -432,6 +432,34 @@ sandbox is additive capability, never a forced rewrite.
   containers. The normal `backend-tests` job stays independent and keeps
   the process backend as the default (`SANDBOX_BACKEND=process` sanity
   step); the container gate never weakens security flags to pass.
+**Live Linux gate result (authoritative, not a local skip):** CI run
+`36594685532` on commit `5488686` (GitHub-hosted `ubuntu-24.04`, CPython
+3.12.14) is **green in all three jobs**:
+
+- `container-gate`: runtime proven (docker version + `docker info` + a
+  real `docker run … true`), image pulled, then `pytest … -m live -q -rs`
+  → **19 passed, 0 skipped** (any skip fails the gate) and the non-live
+  half → **64 passed, 3 skipped**. This covers the live container quota
+  kills with honest attribution (`--memory` OOM → `killed_reason=memory`,
+  CPU ulimit → `cpu`, `--ulimit fsize` → `fsize`, `--pids-limit`), the
+  hardening invariants (non-root user, `--cap-drop ALL` +
+  `no-new-privileges` + `--read-only`, no network, filesystem confinement)
+  and the real RAIVISOX paths (python_exec / shell_exec / codegen / DoD)
+  executing inside actual containers.
+- `backend-tests`: **524 passed, 32 skipped** for the full suite and
+  **524 passed, 28 skipped** for the explicit `-m "not live_llm"`
+  selection, on a clean Linux checkout — including the POSIX-only
+  process-backend quota attributions (SIGXCPU → `cpu`, CPython's ignored
+  SIGXFSZ surfacing as EFBIG → `fsize`) and the process-group cleanup
+  test that proves a sandbox child never shares the host's group.
+- `frontend-validation`: `tsc --noEmit` clean and the production build
+  succeeds from the committed lockfile (the Linux-targeted lockfile the
+  job's `npm ci` requires).
+
+Local (Windows) runs remain a development signal only: the POSIX-only
+quota and `/proc` tests skip there with an explicit reason and are never
+reported as passes.
+
 - Unresolved question 3 (fail closed vs. fail documented) is answered as:
   an **invalid** `SANDBOX_BACKEND` value raises loudly at construction; a
   **valid but unavailable** backend fails each execution honestly (§5 row
