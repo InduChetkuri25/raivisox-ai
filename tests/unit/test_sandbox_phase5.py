@@ -164,6 +164,28 @@ async def test_process_cleanup_after_timeout(workspace):
     assert r.killed_reason == "timeout"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+async def test_child_runs_in_its_own_process_group(workspace):
+    """The sandbox child must never share the host's process group.
+
+    Timeout/cancellation cleanup kills the child's process GROUP so
+    descendants are reaped too. If the child shared the host's group that
+    kill would signal pytest (and its runner) instead — the exact failure
+    that orphaned the CI job once the preexec-free spawn path started
+    working. This asserts the invariant that makes the group kill safe.
+    """
+    r = await ProcessSandbox().run(_spec(
+        workspace,
+        "import os; print(os.getpgid(0), os.getpgid(os.getppid()))",
+    ))
+    assert r.success, r.error
+    child_pgid, parent_pgid = (int(part) for part in r.stdout.split())
+    assert child_pgid != parent_pgid, (
+        "child inherited the host process group; a group kill would "
+        "signal pytest itself"
+    )
+
+
 async def test_process_strict_quota_refuses_unenforceable_limit(workspace):
     """AVAILABLE BUT UNSUPPORTED → honest refusal, no process, no fallback."""
     caps = ProcessSandbox().capabilities()

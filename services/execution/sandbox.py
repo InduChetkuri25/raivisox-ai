@@ -342,6 +342,16 @@ class ProcessSandbox:
             enforced.append("fsize_limit")
 
         start = time.monotonic()
+        # POSIX: spawn the child in its OWN session/process group. The
+        # timeout and cancellation cleanup kills the group
+        # (os.killpg(getpgid(pid))) so descendants are reaped too - without
+        # this, the child shares the parent's group and that kill signals
+        # the host process itself (observed on CI: it SIGKILLed pytest and
+        # the runner's worker, orphaning the job). start_new_session is the
+        # documented, preexec-free way to do this (POSIX-only option).
+        spawn_kwargs: dict[str, object] = {}
+        if self._posix:
+            spawn_kwargs["start_new_session"] = True
         try:
             spawn_argv = (self._wrap_argv_posix(spec)
                           if (self._posix and self._has_resource) else list(spec.argv))
@@ -352,6 +362,7 @@ class ProcessSandbox:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=spec.cwd,
                 env=env,
+                **spawn_kwargs,
             )
         except Exception as e:  # spawn failure — honest failure, no fallback
             # Include the message: subprocess wraps the child-side exec
@@ -463,11 +474,20 @@ class ProcessSandbox:
         )
 
     async def _kill_tree(self, proc: asyncio.subprocess.Process) -> None:
-        """Kill the child (and its group on POSIX) and reap it."""
+        """Kill the child (and its own group on POSIX) and reap it."""
         try:
             if self._posix:
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    pgid = os.getpgid(proc.pid)
+                    # SAFETY: never signal the host's own process group. The
+                    # child is spawned with start_new_session, so a distinct
+                    # group is the expected case; if it is somehow shared,
+                    # kill only this child rather than the whole session
+                    # (which would take pytest and the runner down with it).
+                    if pgid == os.getpgid(0):
+                        proc.kill()
+                    else:
+                        os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     proc.kill()
             else:
