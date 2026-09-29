@@ -60,7 +60,7 @@ jobs:
       - name: Run full suite (live_llm auto-skipped without Ollama)
         run: |
           set -o pipefail
-          pytest -q -x --timeout=120 --timeout-method=thread 2>&1 | tee pytest_full.txt
+          pytest -q --timeout=120 --timeout-method=thread 2>&1 | tee pytest_full.txt
         timeout-minutes: 25
 
       - name: Run non-live-LLM selection explicitly
@@ -177,7 +177,10 @@ jobs:
         timeout-minutes: 15
 
       - name: Container-backend static/unit tests (non-live half)
-        run: pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py -m "not live" -q
+        run: |
+          set -o pipefail
+          pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py \
+            -m "not live" -q --timeout=120 --timeout-method=thread 2>&1 | tee container_nonlive_results.txt
         timeout-minutes: 10
 
       - name: Clean up CI test database

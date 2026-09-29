@@ -193,14 +193,28 @@ async def test_python_exec_failure_propagates(registry):
 # Permission / security boundaries
 # ---------------------------------------------------------------------------
 
-async def test_path_outside_workspace_denied(registry):
-    target = "C:/Windows/raivisox_should_not_exist.txt"
+async def test_path_outside_workspace_denied(registry, workspace):
+    # Absolute and outside the workspace on EVERY platform. "C:/Windows/..."
+    # is only absolute on Windows: on POSIX it is an ordinary relative name
+    # that resolves INSIDE the task scope, so that form asserted
+    # Windows-only behaviour (the write was legitimately allowed on Linux).
+    target = os.path.join(os.path.dirname(os.path.abspath(workspace)),
+                          "raivisox_should_not_exist.txt")
     r = await registry.run(
         "fs_write", {"path": target, "content": "nope"}, ctx_for()
     )
     assert not r.success
     assert "outside the workspace" in (r.error or "")
     assert not os.path.exists(target)
+    # Relative traversal out of the task scope is denied identically.
+    r2 = await registry.run(
+        "fs_write",
+        {"path": os.path.join("..", "..", "raivisox_should_not_exist.txt"),
+         "content": "nope"},
+        ctx_for(),
+    )
+    assert not r2.success, r2.error
+    assert "outside the workspace" in (r2.error or "")
 
 
 async def test_kernel_permission_rejection(workspace):
