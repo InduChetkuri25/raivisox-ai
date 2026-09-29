@@ -566,3 +566,45 @@ async def test_secret_isolation_unchanged_under_quotas(workspace):
     assert r.success, r.error
     assert r.stdout.strip() == "ABSENT"
     assert SECRET_VALUE not in r.stdout + r.stderr
+
+
+# ---------------------------------------------------------------------------
+# 8. Cancellation cleanup (Phase 5: cleanup after cancellation)
+# ---------------------------------------------------------------------------
+
+async def test_cancellation_kills_child_and_cleans_up(workspace):
+    """Cancelling a run kills/reaps the child before propagating - the
+    process never outlives the run. (POSIX process-group kill; Windows
+    kills the direct child - both satisfy the cleanup guarantee.)"""
+    if os.name != "posix":
+        pytest.skip("cross-platform orphan scan via /proc needs Linux")
+    sb = ProcessSandbox()
+    inner = _spec(workspace, "import time; time.sleep(60)", timeout_s=60)
+    task = asyncio.create_task(sb.run(inner))
+    await asyncio.sleep(3)  # let the child actually start
+
+    def _orphans() -> list[int]:
+        pids = []
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    cmd = fh.read().decode(errors="replace")
+            except OSError:
+                continue
+            if "sleep(60)" in cmd and f"{os.getpid()}" not in cmd:
+                pids.append(int(pid))
+        return pids
+
+    try:
+        before = _orphans()
+    except FileNotFoundError:
+        pytest.skip("/proc not available")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.5)
+    after = _orphans()
+    new_survivors = [p for p in after if p not in before]
+    assert new_survivors == [], f"orphaned children survived cancellation: {new_survivors}"
