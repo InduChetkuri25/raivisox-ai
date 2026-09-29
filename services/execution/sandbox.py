@@ -256,7 +256,9 @@ class ProcessSandbox:
 
     # Token grammar: NAME=SOFT[:HARD]; HARD defaults to SOFT (so "FOO=5"
     # means soft==hard==5, exactly as before) — see _wrap_argv_posix for why
-    # the CPU limit deliberately uses a soft/hard pair.
+    # the CPU limit deliberately uses a soft/hard pair. argv[2] carries the
+    # intended environment KEYS (colon-separated) so the wrapper can hand the
+    # child exactly that environment.
     _RLIMIT_WRAPPER = (
         "import os, resource, sys\n"
         "limits = []\n"
@@ -267,11 +269,23 @@ class ProcessSandbox:
         "        limits.append((getattr(resource, name), int(soft), int(hard or soft)))\n"
         "for res, soft, hard in limits:\n"
         "    resource.setrlimit(res, (soft, hard))\n"
-        "os.execv(sys.argv[2], sys.argv[2:])\n"
+        "keep = set(sys.argv[2].split(':')) if sys.argv[2] else set()\n"
+        "for key in list(os.environ):\n"
+        "    if key not in keep:\n"
+        "        del os.environ[key]\n"
+        "os.execv(sys.argv[3], sys.argv[3:])\n"
     )
 
-    def _wrap_argv_posix(self, spec: SandboxSpec) -> list[str]:
-        """POSIX argv with the rlimit wrapper as trusted argv[0]."""
+    def _wrap_argv_posix(self, spec: SandboxSpec,
+                         env_keys: tuple[str, ...] = ()) -> list[str]:
+        """POSIX argv with the rlimit wrapper as trusted argv[0].
+
+        ``env_keys`` (the spec's built environment) is passed through so the
+        wrapper can prune anything the interpreter added to its own environ:
+        CPython's locale coercion (PEP 538) sets LC_CTYPE, and execv would
+        otherwise hand that mutation to the child — an environment variable
+        the spec never allowed.
+        """
         limits: list[str] = []
         if spec.cpu_seconds is not None:
             # soft < hard: the kernel's soft-limit SIGXCPU is the
@@ -289,7 +303,8 @@ class ProcessSandbox:
             return list(spec.argv)
         return [
             sys.executable, "-c", self._RLIMIT_WRAPPER,
-            ",".join(limits), spec.argv[0], *spec.argv[1:],
+            ",".join(limits), ":".join(sorted(env_keys)),
+            spec.argv[0], *spec.argv[1:],
         ]
 
     async def run(self, spec: SandboxSpec) -> SandboxResult:
@@ -370,7 +385,7 @@ class ProcessSandbox:
         if self._posix:
             spawn_kwargs["start_new_session"] = True
         try:
-            spawn_argv = (self._wrap_argv_posix(spec)
+            spawn_argv = (self._wrap_argv_posix(spec, tuple(env))
                           if (self._posix and self._has_resource) else list(spec.argv))
             proc = await asyncio.create_subprocess_exec(
                 *spawn_argv,

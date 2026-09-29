@@ -193,26 +193,28 @@ def test_process_quota_reason_truth_table_static():
                       "")[0] is None
 
 
-def test_wrapper_argv_encodes_cpu_as_soft_hard_pair(tmp_path):
-    """RLIMIT_CPU is encoded soft:hard with soft < hard so the kernel's soft
-    SIGXCPU (the attributable death) wins instead of racing the hard-limit
-    SIGKILL, which is indistinguishable from an external kill. Memory and
-    fsize stay soft==hard, and the wrapped command is passed through
-    unmodified as argv-only (never a shell string)."""
+def test_wrapper_argv_encodes_limits_and_env_keys(tmp_path):
+    """The wrapper argv is fully explicit: RLIMIT_CPU as a soft:hard pair
+    (soft < hard so the kernel's attributable SIGXCPU wins instead of racing
+    the hard-limit SIGKILL), memory/fsize as soft==hard, the EXACT child
+    environment keys (so interpreter-side additions like locale coercion's
+    LC_CTYPE are pruned before exec), and the wrapped command unmodified as
+    argv-only (never a shell string)."""
     sb = ProcessSandbox()
     spec = SandboxSpec(
         argv=[sys.executable, "-c", "print(1)"], cwd=str(tmp_path), env={},
         cpu_seconds=2, memory_bytes=1 << 20, fsize_bytes=4096,
     )
-    argv = sb._wrap_argv_posix(spec)
+    argv = sb._wrap_argv_posix(spec, tuple(["PATH", "HOME"]))
     assert argv[0] == sys.executable and argv[1] == "-c"
     assert argv[3].split(",") == ["RLIMIT_CPU=2:3", f"RLIMIT_AS={1 << 20}",
                                   "RLIMIT_FSIZE=4096"]
-    assert argv[4:] == [sys.executable, "-c", "print(1)"]
+    assert argv[4] == "HOME:PATH"  # sorted, colon-separated
+    assert argv[5:] == [sys.executable, "-c", "print(1)"]
     # no limits requested → the plain argv, no wrapper at all
     plain = SandboxSpec(argv=[sys.executable, "-c", "print(1)"],
                         cwd=str(tmp_path), env={})
-    assert sb._wrap_argv_posix(plain) == [sys.executable, "-c", "print(1)"]
+    assert sb._wrap_argv_posix(plain, ()) == [sys.executable, "-c", "print(1)"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
