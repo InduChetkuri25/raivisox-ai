@@ -370,7 +370,18 @@ def test_adapter_rejects_traversal_outside_task_scope():
     task_id = f"task-{uuid.uuid4().hex[:8]}"
     writer = FileWriteAdapter(TASK_WORKSPACE)
     ctx = AdapterContext(actor_id="p", task_id=task_id, step_id="s1", resource=f"task:{task_id}")
-    for probe in ("../other-task/steal.py", "..\\..\\outside.txt", "/etc/raivisox_pwn"):
+    probes = [
+        "../other-task/steal.py",
+        "../../outside.txt",                       # POSIX-style traversal
+        os.path.join("..", "..", "outside.txt"),   # native traversal
+        "/etc/raivisox_pwn",                       # absolute
+    ]
+    if os.name == "nt":
+        # A backslash path is a traversal only on Windows; on POSIX it is an
+        # ordinary (allowed) filename, so asserting denial there would be
+        # asserting a falsehood.
+        probes.append("..\\..\\outside.txt")
+    for probe in probes:
         r = asyncio.run(writer.run({"path": probe, "content": "x"}, ctx))
         assert not r.success, probe
         assert "denied" in (r.error or "").lower()

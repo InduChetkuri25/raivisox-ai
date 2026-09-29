@@ -105,11 +105,15 @@ async def test_child_env_is_minimal_and_allowlisted(sandbox, workspace):
     keys = eval(r.stdout.strip())  # noqa: S307 (test-only, sandbox output)
     assert "RAIVISOX_RANDOM_UNLISTED" not in keys
     assert SECRET_KEY_NAME not in keys
-    # Only allowlisted keys may appear at all
-    assert all(k in (
-        "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "WINDIR",
-        "TEMP", "TMP", "PATH", "PYTHONIOENCODING", "PYTHONUTF8",
-        "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA") for k in keys)
+    # Only the sandbox's OWN declared allowlist may reach the child. Read it
+    # from the module instead of duplicating the list here (a duplicated copy
+    # drifts and hides exactly this class of leak).
+    from services.execution.sandbox import _ALLOWED_ENV_KEYS
+
+    extra = sorted(k for k in keys if k not in _ALLOWED_ENV_KEYS)
+    assert not extra, (
+        f"non-allowlisted environment keys reached the child: {extra}"
+    )
 
 
 async def test_secret_isolation_value_never_leaks(sandbox, workspace):

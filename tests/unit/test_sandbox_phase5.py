@@ -30,6 +30,7 @@ in the CI container gate and skip honestly here (no runtime on Windows).
 
 import asyncio
 import os
+import signal
 import sys
 
 import pytest
@@ -162,6 +163,56 @@ async def test_process_cleanup_after_timeout(workspace):
                    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
                    "time.sleep(60)", timeout_s=2))
     assert r.killed_reason == "timeout"
+
+
+def test_process_quota_reason_truth_table_static():
+    """Process-backend attribution is honest by construction (no runtime
+    needed): a claim exists only where the evidence is unambiguous."""
+    from services.execution.sandbox import process_quota_reason as reason
+
+    # SIGXCPU/SIGXFSZ exist only on POSIX; on Windows every negative-code
+    # branch honestly falls through to the supervisor class.
+    sigxcpu = getattr(signal, "SIGXCPU", None)
+    sigxfsz = getattr(signal, "SIGXFSZ", None)
+    if sigxcpu is not None:
+        assert reason(-sigxcpu, ["cpu_limit"], "")[0] == "cpu"
+    if sigxfsz is not None:
+        assert reason(-sigxfsz, ["fsize_limit"], "")[0] == "fsize"
+    # every other signal is a generic supervisor kill - never an invented
+    # quota cause (SIGKILL could be OOM, an external kill, or anything else)
+    assert reason(-9, ["memory_limit"], "")[0] == "supervisor"
+    assert reason(-9, ["cpu_limit", "memory_limit"], "")[0] == "supervisor"
+    # CPython ignores SIGXFSZ → EFBIG text with a POSITIVE exit, attributed
+    # only when fsize was enforced this run
+    assert reason(1, ["fsize_limit"], "OSError: EFBIG")[0] == "fsize"
+    assert reason(1, ["fsize_limit"], "File too large")[0] == "fsize"
+    assert reason(1, [], "OSError: EFBIG")[0] is None
+    # ordinary exits are never quota claims
+    for code in (None, 0, 1, 2, 42, 126, 127):
+        assert reason(code, ["cpu_limit", "memory_limit", "fsize_limit"],
+                      "")[0] is None
+
+
+def test_wrapper_argv_encodes_cpu_as_soft_hard_pair(tmp_path):
+    """RLIMIT_CPU is encoded soft:hard with soft < hard so the kernel's soft
+    SIGXCPU (the attributable death) wins instead of racing the hard-limit
+    SIGKILL, which is indistinguishable from an external kill. Memory and
+    fsize stay soft==hard, and the wrapped command is passed through
+    unmodified as argv-only (never a shell string)."""
+    sb = ProcessSandbox()
+    spec = SandboxSpec(
+        argv=[sys.executable, "-c", "print(1)"], cwd=str(tmp_path), env={},
+        cpu_seconds=2, memory_bytes=1 << 20, fsize_bytes=4096,
+    )
+    argv = sb._wrap_argv_posix(spec)
+    assert argv[0] == sys.executable and argv[1] == "-c"
+    assert argv[3].split(",") == ["RLIMIT_CPU=2:3", f"RLIMIT_AS={1 << 20}",
+                                  "RLIMIT_FSIZE=4096"]
+    assert argv[4:] == [sys.executable, "-c", "print(1)"]
+    # no limits requested → the plain argv, no wrapper at all
+    plain = SandboxSpec(argv=[sys.executable, "-c", "print(1)"],
+                        cwd=str(tmp_path), env={})
+    assert sb._wrap_argv_posix(plain) == [sys.executable, "-c", "print(1)"]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")

@@ -101,10 +101,14 @@ def test_dev_environment_always_passes():
 
 def test_production_defaults_refused_with_variable_names_only():
     with pytest.raises(RuntimeError) as ei:
+        # Explicit inputs, not ambient ones: the CI job exports SECRET_KEY,
+        # which would otherwise silently satisfy the requirement and drop
+        # SECRET_KEY from the refusal message (a false pass of this test).
         validate_settings(
             Settings(
                 _env_file=None,
                 environment="production",
+                secret_key=DEV_SECRET_KEY,
                 database_url=DEV_DATABASE_URL,
             )
         )
@@ -397,7 +401,8 @@ def test_atomic_claim_has_single_winner():
 def test_lifespan_refuses_default_secret_in_production(monkeypatch):
     """Defense in depth: even if env validation were bypassed at import,
     lifespan startup refuses an unsafe production configuration."""
-    bad = Settings(_env_file=None, environment="production")
+    bad = Settings(_env_file=None, environment="production",
+                   secret_key=DEV_SECRET_KEY, database_url=DEV_DATABASE_URL)
     monkeypatch.setattr(app_main, "settings", bad)
     with pytest.raises(Exception) as ei:  # noqa: B017 — wrapping differs by starlette version
         with TestClient(app_main.app):
@@ -426,7 +431,11 @@ def test_production_import_fails_fast_without_config():
     """`import app.main` with ENVIRONMENT=production and missing secrets
     must abort the process before serving anything — and the error must
     name variables, never values."""
-    env = _subprocess_env(ENVIRONMENT="production")
+    # Clear the CI job's own values so the test asserts the intended
+    # scenario (production with NO configured secret) on any machine.
+    env = _subprocess_env(ENVIRONMENT="production", SECRET_KEY=None,
+                          DATABASE_URL=None, CORS_ORIGINS=None,
+                          ALLOWED_HOSTS=None)
     proc = subprocess.run(
         [sys.executable, "-c", "import app.main"],
         cwd=_REPO,

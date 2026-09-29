@@ -249,7 +249,13 @@ def test_pipeline_positive_factorial(client):
     # The generated artifact exists on disk and solve() REALLY executes.
     import importlib.util
 
-    ws_generated = os.path.join(os.getcwd(), "workspaces", "tasks", "generated")
+    # Per-task workspace scoping: the artifact lives under THIS task's own
+    # directory (the flat “tasks/generated” path only existed before that
+    # scoping, so a stale leftover made this pass on a dirty machine while
+    # clean checkouts failed).
+    from app.main import TASK_WORKSPACE
+
+    ws_generated = os.path.join(TASK_WORKSPACE, task_id, "generated")
     for m in modules:
         mod_path = os.path.join(ws_generated, f"{m['module']}.py")
         assert os.path.isfile(mod_path), mod_path

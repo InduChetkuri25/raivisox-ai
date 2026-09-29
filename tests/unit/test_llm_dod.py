@@ -209,7 +209,10 @@ def test_llm_receives_goal_not_title(client, monkeypatch):
 
     seen = set()
     for m in modules:
-        path = os.path.join(TASK_WORKSPACE, "generated", f"{m['module']}.py")
+        # Per-task workspace scoping: this task's own directory, not a flat
+        # “tasks/generated” path (which only a stale leftover satisfied).
+        path = os.path.join(TASK_WORKSPACE, task_id, "generated",
+                            f"{m['module']}.py")
         assert os.path.isfile(path), path
         with open(path, encoding="utf-8") as f:
             src = f.read()
