@@ -94,6 +94,39 @@ jobs:
           docker run --rm "${SANDBOX_CONTAINER_IMAGE}" true \
             || { echo '::error::basic container failed to start'; exit 1; }
 
+      - name: Diagnose host spawn with/without preexec_fn (A/B evidence)
+        run: |
+          python - <<'PY'
+          import asyncio, sys, os, resource
+
+          def preexec():
+              pass
+
+          async def try_spawn(label, **kw):
+              try:
+                  p = await asyncio.create_subprocess_exec(
+                      sys.executable, "-c", "print('ok')",
+                      stdout=asyncio.subprocess.PIPE,
+                      stderr=asyncio.subprocess.PIPE, **kw)
+                  out, err = await p.communicate()
+                  print(f"{label}: OK rc={p.returncode} out={out!r} err={err!r}")
+              except BaseException as e:
+                  print(f"{label}: FAIL {type(e).__name__}: {e}")
+
+          async def main():
+              print("python", sys.version)
+              print("posix", os.name == "posix", "has_resource",
+                    __import__("importlib.util", fromlist=["util"]).util.find_spec("resource") is not None)
+              await try_spawn("plain")
+              await try_spawn("preexec_noop", preexec_fn=preexec)
+              await try_spawn("cwd_tmp", cwd="/tmp")
+              await try_spawn("env_min", env={"PATH": os.environ.get("PATH", "/usr/bin")})
+              await try_spawn("preexec+cwd+env", preexec_fn=preexec,
+                              cwd="/tmp", env={"PATH": os.environ.get("PATH", "/usr/bin")})
+
+          asyncio.run(main())
+          PY
+
       - name: Pull the sandbox image (tests only inspect, they never pull)
         run: docker pull "${SANDBOX_CONTAINER_IMAGE}"
 

@@ -280,7 +280,9 @@ def test_container_quota_flags_only_for_requested_limits(tmp_path):
     assert rich[rich.index("--memory") + 1] == "268435456"
     assert rich[rich.index("--pids-limit") + 1] == "16"
     ulimits = [rich[i + 1] for i, c in enumerate(rich) if c == "--ulimit"]
-    assert ulimits == ["cpu=3:3", "fsize=2048:2048"]
+    # cpu soft<hard: SIGXCPU (exit 152) is observable; soft==hard would
+    # SIGKILL immediately (137) and be indistinguishable from an OOM.
+    assert ulimits == ["cpu=3:4", "fsize=2048:2048"]
 
 
 def test_container_enforced_lists_only_requested_quota_limits(tmp_path):
@@ -384,15 +386,22 @@ async def test_live_container_pid_limit_blocks_fork_bomb(tmp_path):
 
 @live
 async def test_live_container_cpu_limit_kills_with_cpu_reason(tmp_path):
+    """soft<hard ulimit: kernel SIGXCPU at the soft limit → exit 152 →
+    honest 'cpu' attribution (soft==hard would SIGKILL as 137, which is
+    indistinguishable from an OOM and must NOT be attributed)."""
     sb = ContainerSandbox()
     r = await sb.run(_spec(tmp_path, "x = 0\nwhile True:\n    x += 1\n",
                            cpu_seconds=2, timeout_s=30))
-    assert r.killed_reason in ("cpu", "supervisor")  # runtime-dependent wording
     assert r.success is False
+    assert r.killed_reason == "cpu", (r.killed_reason, r.stderr)
+    assert "cpu" in r.limits_hit
 
 
 @live
 async def test_live_container_fsize_ulimit_kills_write(tmp_path):
+    """CPython ignores SIGXFSZ, so the oversized write fails with EFBIG
+    (exit 1); the child's own error text is the honest attribution
+    evidence, and the limit provably held (no oversized bytes landed)."""
     sb = ContainerSandbox()
     code = ("f = open('big.bin', 'wb')\n"
             "try:\n"
@@ -401,7 +410,10 @@ async def test_live_container_fsize_ulimit_kills_write(tmp_path):
             "    f.close()\n")
     r = await sb.run(_spec(tmp_path, code, fsize_bytes=4096, timeout_s=20))
     assert r.success is False
-    assert r.killed_reason in ("fsize", "supervisor")
+    assert r.killed_reason == "fsize", (r.killed_reason, r.stderr)
+    assert "fsize" in r.limits_hit
+    big = tmp_path / "big.bin"
+    assert not big.exists() or big.stat().st_size <= 4096
 
 
 @live

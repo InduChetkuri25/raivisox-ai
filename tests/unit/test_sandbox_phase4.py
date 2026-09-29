@@ -336,7 +336,8 @@ def test_run_argv_limits_map_to_runtime_flags(tmp_path):
     assert rich[rich.index("--memory") + 1] == "134217728"
     assert rich[rich.index("--pids-limit") + 1] == "32"
     ulimits = [rich[i + 1] for i, c in enumerate(rich) if c == "--ulimit"]
-    assert ulimits == ["cpu=7:7", "fsize=4096:4096"]
+    # cpu soft<hard so the kernel's SIGXCPU death is honestly attributable
+    assert ulimits == ["cpu=7:8", "fsize=4096:4096"]
 
 
 def test_container_env_never_reads_process_environ(tmp_path, monkeypatch):

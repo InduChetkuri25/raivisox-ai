@@ -267,7 +267,11 @@ def build_run_argv(
     if spec.max_pids is not None:
         cmd += ["--pids-limit", str(spec.max_pids)]
     if spec.cpu_seconds is not None:
-        cmd += ["--ulimit", f"cpu={spec.cpu_seconds}:{spec.cpu_seconds}"]
+        # soft < hard: the kernel delivers SIGXCPU at the soft limit (death
+        # surfaces as exit 152 = 128+24, honestly attributable), with a one
+        # second hard-limit grace before SIGKILL. soft==hard would SIGKILL
+        # immediately (exit 137), which is indistinguishable from an OOM.
+        cmd += ["--ulimit", f"cpu={spec.cpu_seconds}:{spec.cpu_seconds + 1}"]
     if spec.fsize_bytes is not None:
         cmd += ["--ulimit", f"fsize={spec.fsize_bytes}:{spec.fsize_bytes}"]
     cmd += ["-v", f"{writable}:{CONTAINER_WORKSPACE}:rw"]
@@ -492,7 +496,7 @@ class ContainerSandbox:
                 )
             except Exception as e:  # spawn failure — honest failure
                 return SandboxResult(
-                    error=f"spawn failed: {type(e).__name__}",
+                    error=f"spawn failed: {type(e).__name__}: {e}",
                     killed_reason="supervisor",
                     duration_ms=int((time.monotonic() - start) * 1000),
                     enforced=enforced,
@@ -580,6 +584,15 @@ class ContainerSandbox:
                 killed_reason = "memory"
                 limits_hit.append("memory")
                 er = (er + "\n[sandbox: child killed at the memory limit]").strip()
+            elif (rc not in (0, None) and "fsize_limit" in enforced
+                  and ("EFBIG" in er or "File too large" in er)):
+                # CPython ignores SIGXFSZ, so a too-large write fails with a
+                # Python OSError (EFBIG) and exit 1 instead of signal death
+                # 153. The child's own error text names the cause - honest
+                # evidence-based attribution, not invention.
+                killed_reason = "fsize"
+                limits_hit.append("fsize")
+                er = (er + "\n[sandbox: child blocked by the file-size limit]").strip()
 
             # V2 Phase 5 — budget accounting after the run. The host cannot
             # read the container's rusage cheaply, so wall duration is the

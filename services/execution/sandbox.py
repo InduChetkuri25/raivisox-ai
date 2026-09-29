@@ -319,8 +319,11 @@ class ProcessSandbox:
                 preexec_fn=self._preexec if (self._posix and self._has_resource) else None,
             )
         except Exception as e:  # spawn failure — honest failure, no fallback
+            # Include the message: subprocess wraps the child-side exec
+            # failure protocol (errno/strerror) in the exception text, and
+            # without it a spawn failure is undiagnosable.
             return SandboxResult(
-                error=f"spawn failed: {type(e).__name__}",
+                error=f"spawn failed: {type(e).__name__}: {e}",
                 killed_reason="supervisor",
                 duration_ms=int((time.monotonic() - start) * 1000),
                 enforced=enforced,
