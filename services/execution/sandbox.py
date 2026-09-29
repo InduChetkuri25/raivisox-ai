@@ -48,7 +48,14 @@ __all__ = [
     "ProcessSandbox",
     "SandboxQuota",
     "ExecutionBudget",
+    "process_quota_reason",
 ]
+
+# POSIX-only signal numbers. They are absent on Windows, where subprocess
+# return codes are never negative — so the signal branch of the process
+# attribution below is simply unreachable there (guarded, not assumed).
+_SIGXCPU = getattr(signal, "SIGXCPU", None)
+_SIGXFSZ = getattr(signal, "SIGXFSZ", None)
 
 KilledReason = Literal[
     "timeout",
@@ -247,15 +254,19 @@ class ProcessSandbox:
     # embedded constant below; and a wrapper death (e.g. the soft limit
     # itself) fails the run honestly - there is no unconfined exec path.
 
+    # Token grammar: NAME=SOFT[:HARD]; HARD defaults to SOFT (so "FOO=5"
+    # means soft==hard==5, exactly as before) — see _wrap_argv_posix for why
+    # the CPU limit deliberately uses a soft/hard pair.
     _RLIMIT_WRAPPER = (
         "import os, resource, sys\n"
         "limits = []\n"
         "for token in sys.argv[1].split(','):\n"
         "    if token:\n"
         "        name, value = token.split('=')\n"
-        "        limits.append((getattr(resource, name), int(value)))\n"
-        "for res, value in limits:\n"
-        "    resource.setrlimit(res, (value, value))\n"
+        "        soft, _, hard = value.partition(':')\n"
+        "        limits.append((getattr(resource, name), int(soft), int(hard or soft)))\n"
+        "for res, soft, hard in limits:\n"
+        "    resource.setrlimit(res, (soft, hard))\n"
         "os.execv(sys.argv[2], sys.argv[2:])\n"
     )
 
@@ -263,7 +274,13 @@ class ProcessSandbox:
         """POSIX argv with the rlimit wrapper as trusted argv[0]."""
         limits: list[str] = []
         if spec.cpu_seconds is not None:
-            limits.append(f"RLIMIT_CPU={spec.cpu_seconds}")
+            # soft < hard: the kernel's soft-limit SIGXCPU is the
+            # deterministic, attributable death. With soft==hard the kernel
+            # races SIGXCPU against the hard-limit SIGKILL, and a SIGKILL
+            # (reported as a generic supervisor kill) can win — the same
+            # rule the container backend's ulimit uses.
+            limits.append(
+                f"RLIMIT_CPU={spec.cpu_seconds}:{spec.cpu_seconds + 1}")
         if spec.memory_bytes is not None:
             limits.append(f"RLIMIT_AS={spec.memory_bytes}")
         if spec.fsize_bytes is not None:
@@ -438,21 +455,12 @@ class ProcessSandbox:
         # are NOT quota terminations. Only kernel-delivered resource
         # signals map onto the quota vocabulary; anything else stays an
         # honest supervisor-class failure.
-        killed_reason: KilledReason | None = None
-        if proc.returncode is not None and proc.returncode < 0:
-            signum = -proc.returncode
-            reason = self._signal_reason(signum)
-            killed_reason = reason  # "cpu" | "fsize" | "supervisor"
-            limits_hit.append(reason)
-            if reason == "cpu":
-                err = (err + "\n[sandbox: child killed by CPU limit "
-                       "(SIGXCPU)]").strip()
-            elif reason == "fsize":
-                err = (err + "\n[sandbox: child killed by file-size limit "
-                       "(SIGXFSZ)]").strip()
-            else:
-                err = (err + f"\n[sandbox: child terminated by signal "
-                       f"{signum}]").strip()
+        killed_reason, quota_suffix = process_quota_reason(
+            proc.returncode, enforced, err)
+        if killed_reason is not None:
+            limits_hit.append(killed_reason)
+            if quota_suffix:
+                err = (err + "\n" + quota_suffix).strip()
 
         limits_hit.append(f"cpu_used:{cpu_used:.3f}")
 
@@ -516,18 +524,40 @@ class ProcessSandbox:
         text, truncated = _truncate(buf, limit)
         return text, truncated, truncated
 
-    @staticmethod
-    def _signal_reason(signum: int) -> str:
-        """Quota attribution from the signal the KERNEL delivered.
 
-        Only kernel-delivered resource signals are attributed: SIGXCPU →
-        ``cpu`` (RLIMIT_CPU), SIGXFSZ → ``fsize`` (RLIMIT_FSIZE). SIGKILL
-        is deliberately NOT attributed to memory: the killer is unknowable
-        (external kill vs OOM reclaim), and the design's rule is to report
-        an honest generic supervisor failure rather than invent a cause.
-        """
-        return {signal.SIGXCPU: "cpu", signal.SIGXFSZ: "fsize"}.get(
-            signum, "supervisor")
+# Signal-based attribution lives in process_quota_reason below (single
+# source of truth): SIGXCPU → cpu, SIGXFSZ → fsize, anything else →
+# supervisor. SIGKILL is deliberately NOT attributed to memory — the killer
+# is unknowable (external kill vs OOM reclaim) — never invent a cause.
+
+
+def process_quota_reason(returncode: int | None, enforced: list[str],
+                         stderr: str) -> tuple[KilledReason | None, str | None]:
+    """Honest quota attribution for the PROCESS backend's child exit.
+
+    Mirrors the container backend's ``quota_reason_from_exit``: only
+    kernel-attributed signals and provable text evidence are claimed.
+
+    - SIGXCPU → ``cpu``; SIGXFSZ → ``fsize``; any other signal →
+      ``supervisor`` (the killer is unknowable, never invented).
+    - CPython ignores SIGXFSZ, so an RLIMIT_FSIZE violation normally
+      surfaces as a Python ``OSError: EFBIG`` / "File too large" with a
+      POSITIVE exit code rather than signal death. That text is evidence
+      for ``fsize`` — but only when the fsize limit was enforced this run.
+    - Ordinary exits → ``None``: never a quota claim.
+    """
+    if returncode is not None and returncode < 0:
+        signum = -returncode
+        if _SIGXCPU is not None and signum == _SIGXCPU:
+            return "cpu", "[sandbox: child killed by CPU limit (SIGXCPU)]"
+        if _SIGXFSZ is not None and signum == _SIGXFSZ:
+            return ("fsize",
+                    "[sandbox: child killed by file-size limit (SIGXFSZ)]")
+        return "supervisor", f"[sandbox: child terminated by signal {signum}]"
+    if (returncode not in (None, 0) and "fsize_limit" in enforced
+            and ("EFBIG" in stderr or "File too large" in stderr)):
+        return "fsize", "[sandbox: child blocked by the file-size limit]"
+    return None, None
 
 
 def build_default_sandbox() -> ExecutionSandbox:
