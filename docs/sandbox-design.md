@@ -467,6 +467,7 @@ sandbox is additive capability, never a forced rewrite.
 | 2 | codegen smoke-run + DoD execution through the sandbox | `364ebe9` | unit tests, host-enforced guarantees |
 | 3 | shell/`TerminalSandbox` argv migration (§7 phase 4); no `create_subprocess_shell` remains in untrusted execution | `31b6196` | unit tests, host-enforced guarantees |
 | 4 | container backend (§7 phase 5) + `SANDBOX_BACKEND` selection | `9907958` | unit tests + **live** container gate green on Linux CI (see below) |
+| closeout | workspace write quotas (T8, §5.1) + immutable image pinning (§5.2) | `42e6899` | 70 new unit tests; Linux gate green with a digest-pinned image (`19 passed` live, `594 passed` backend) |
 | 5 | resource quotas + cumulative execution budgets (§5 vocabulary, §7.6) | `5be77ec` | quota model/budget/enforcer unit-tested on both hosts; **live** container quota kills verified in the Linux CI gate (`memory` OOM, CPU, fsize, pids) and the POSIX process-backend attributions (`cpu` SIGXCPU, `fsize` EFBIG) verified on Linux CI too — see the evidence below |
 
 **Container backend verification status (never claim more):**
@@ -524,8 +525,11 @@ sandbox is additive capability, never a forced rewrite.
   `no-new-privileges` + `--read-only`, no network, filesystem confinement)
   and the real RAIVISOX paths (python_exec / shell_exec / codegen / DoD)
   executing inside actual containers.
-- `backend-tests`: **524 passed, 32 skipped** for the full suite and
-  **524 passed, 28 skipped** for the explicit `-m "not live_llm"`
+- The container image is **digest-pinned** (§5.2): the job pulls
+  `python@sha256:a6e34c…` and each run verifies that digest before
+  executing it, so a retag cannot change which bytes the gate certified.
+- `backend-tests`: **594 passed, 32 skipped** for the full suite and
+  **594 passed, 28 skipped** for the explicit `-m "not live_llm"`
   selection, on a clean Linux checkout — including the POSIX-only
   process-backend quota attributions (SIGXCPU → `cpu`, CPython's ignored
   SIGXFSZ surfacing as EFBIG → `fsize`) and the process-group cleanup

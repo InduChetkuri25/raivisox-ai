@@ -1,34 +1,40 @@
 # V2 Final Acceptance Report — Execution Sandbox, Container Backend, Resource Quotas
 
-Date: 2026-09-29
+Date: 2026-09-29, extended 2026-10-20 with the closeout controls (§7).
 Scope: V2 phases 0–5 (symlink-resolving containment, process sandbox, codegen/DoD,
-shell argv migration, container backend, resource quotas + cumulative budgets).
+shell argv migration, container backend, resource quotas + cumulative budgets),
+plus the T8 workspace write quota and immutable image pinning.
 No V3 / Agent Action Graph work is included, started, or implied by this report.
 
 ## 1. Verdict summary
 
 | Gate | Result | Evidence |
 |---|---|---|
-| Linux CI, all three jobs | **PASS** | run `36599092879` on `d88fd42` — every job `success` |
+| Linux CI, all three jobs | **PASS** | run `39408218912` on `42e6899` — every job `success` |
 | Live container gate (19 tests, real Docker) | **PASS** | `19 passed, 67 deselected` with the skip→fail guard active |
 | Live container quota kills | **PASS** | memory OOM → `memory`, CPU → `cpu`, fsize → `fsize`, pids → fork bomb blocked |
 | Real application paths in containers | **PASS** | `python_exec`, `shell_exec`, codegen + DoD through `ContainerSandbox` |
-| Local unit suite (Windows host) | **PASS** | `512 passed, 40 skipped` (Windows-only skips) |
+| Workspace write quota (T8, workspace-scoped) | **PASS** | 70 new unit tests; enforced before app writes and around every execution (§5.1 of the design) |
+| Container image pinned by digest | **PASS** | CI pulls and runs `python@sha256:a6e34c…`; a contradicting or unverifiable image fails closed |
+| Local unit suite (Windows host) | **PASS** | `575 passed, 47 skipped` (Windows-only skips) |
 | Local live LLM gate (real Ollama) | **PASS** | `4 passed` |
 | Frontend typecheck + production build | **PASS** | local `tsc --noEmit` clean, `next build` ok; CI job same |
 | `v1.0.0` tag untouched | **PASS** | `git rev-parse v1.0.0^{commit}` = `74e2c1d6a99a06b064ef6486f337892818961fb6` |
-| T1–T13 threat model | **10 PASS, 2 PARTIAL, 0 NOT VERIFIED** | §5 |
+| T1–T13 threat model | **11 PASS, 1 PARTIAL (T4), 1 out of scope (filesystem-wide disk quota)** | §5 |
 
-Commits under acceptance (newest first): `d88fd42`, `5488686`, `199e49a`, `29919f6`,
-`f1473fe`, `86070d8`, `3228e5f`, `6733eae`, `bacbd6f` (Phase 5), `5be77ec`,
-`9907958` (Phase 4), `eb12496`, `31b6196` (Phase 3) … back to `9b7491b` (Phase 0).
+Commits under acceptance (newest first): `42e6899` (workspace quotas + image
+pinning), `d88fd42`, `5488686`, `199e49a`, `29919f6`, `f1473fe`, `86070d8`,
+`3228e5f`, `6733eae`, `bacbd6f` (Phase 5), `5be77ec`, `9907958` (Phase 4),
+`eb12496`, `31b6196` (Phase 3) … back to `9b7491b` (Phase 0).
 
 ## 2. Live CI container gate (authoritative Linux evidence)
 
 Workflow: `.github/workflows/ci.yml`, repository `InduChetkuri25/raivisox-ai`,
-run [`36599092879`](https://github.com/InduChetkuri25/raivisox-ai/actions/runs/36599092879),
-commit `d88fd42`, Ubuntu runner, `SANDBOX_BACKEND=container`,
-`SANDBOX_CONTAINER_IMAGE=python:3.12-slim`.
+run [`39408218912`](https://github.com/InduChetkuri25/raivisox-ai/actions/runs/39408218912)
+on commit `42e6899` (superseding run
+[`36599092879`](https://github.com/InduChetkuri25/raivisox-ai/actions/runs/36599092879)
+on `d88fd42`), Ubuntu runner, `SANDBOX_BACKEND=container`,
+`SANDBOX_CONTAINER_IMAGE=python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1`.
 
 All three jobs: `success`.
 
@@ -49,6 +55,11 @@ if grep -qE 'skipped|SKIPPED' live_container_results.txt; then
 collected 86 items / 67 deselected / 19 selected
 ====================== 19 passed, 67 deselected in 12.30s ======================
 ```
+
+The image is resolved to an immutable digest before anything runs: the job pulls
+the digest-qualified reference, and each sandbox run re-verifies that digest
+against the pulled image's `RepoDigests` and then executes `repo@sha256:…` — so
+a retag between verification and execution cannot change the bytes.
 
 Those 19 tests are the ten Phase-4 isolation tests, the five Phase-5 quota tests, and the
 four real-application-path tests:
@@ -76,8 +87,8 @@ Linux, not container coverage.
 ### 2.4 Backend and frontend jobs
 
 ```
-========= 524 passed, 32 skipped, 17694 warnings in 110.18s (0:01:50) ==========
-== 524 passed, 28 skipped, 4 deselected, 17694 warnings in 102.18s (0:01:42) ===
+========= 594 passed, 32 skipped, 17693 warnings in 113.96s (0:01:53) ==========
+== 594 passed, 28 skipped, 4 deselected, 17694 warnings in 108.62s (0:01:48) ===
 ```
 
 The second line is the run with the `live_llm` marker deselected (it needs a local
@@ -94,14 +105,14 @@ never counted as passes; the authoritative live evidence is §2.
 
 | Suite | Result |
 |---|---|
-| `tests/unit/*.py` (33 files, OneDrive-safe splits) | `512 passed, 40 skipped` |
+| `tests/unit/*.py` (35 files, OneDrive-safe splits) | `575 passed, 47 skipped` |
 | sandbox suites re-run with skip reasons (`-rs`) | `128 passed, 28 skipped` (19 live, 5 POSIX-only, 4 symlink-privilege) |
 | `tests/test_live_llm.py -m live_llm` (real Ollama) | `4 passed` |
 | `apps/web`: `npx tsc --noEmit` | clean |
 | `apps/web`: `npm run build` | success |
 | `tests/integration`, `tests/e2e` | no test modules exist (0 collected) |
 
-The 40 local skips, each with an explicit reason. Measured directly for the sandbox
+The 47 local skips, each with an explicit reason. Measured directly for the sandbox
 suites, where 28 of them live:
 
 ```
@@ -111,6 +122,11 @@ suites, where 28 of them live:
  5  POSIX-only: SIGXCPU/SIGXFSZ attribution, signal-death semantics, process groups, /proc orphan scan
  4  symlink creation requires privileges on this host
 ```
+
+The closeout tests add 70 cases (workspace quota boundaries, bypass attempts,
+cleanup, digest policy, verification failures). Their Windows-only skips are
+symlink/hardlink/FIFO cases, which the Linux backend job runs for real — the
+same 70 tests pass there inside the `594 passed` above.
 
 Those 19 live skips are exactly the 19 tests the Linux gate runs for real (§2.2) — the
 local skip count and the CI pass count line up one-for-one, which is the property that
@@ -141,23 +157,29 @@ Grades are `PASS`, `PARTIAL`, or `NOT VERIFIED` — nothing else.
 | T5 | Network access from untrusted code | **PASS** | live: `--network none`, egress attempt blocked, `network_deny` reported in `enforced` |
 | T6 | Excessive CPU | **PASS** | live: CPU limit kill, attributed `cpu`; process backend attributes POSIX `SIGXCPU`/`SIGKILL`-with-cpu-only as `cpu` and refuses when unenforceable in strict mode |
 | T7 | Excessive memory | **PASS** | live: memory limit → real OOM kill attributed `memory` (cgroup, not host OOM); process backend reports memory as unenforced on Windows instead of faking it |
-| T8 | Disk exhaustion | **PARTIAL** | app: `QuotaEnforcer.check_write` refuses an oversized write before bytes land (unit-tested), cumulative budget covers repeated runs; OS: per-file `fsize` ulimit live-verified (`EFBIG` → `fsize`). **No total-disk cap on the writable workspace mount** — many files each under the per-file limit can still grow the host disk until the wall-clock/cumulative budget stops the run |
+| T8 | Disk exhaustion — **workspace writes** | **PASS** | `WorkspaceEnforcer` bounds total bytes, per-file bytes, entries and depth, and refuses a write **before** any bytes land (with replace credit and in-flight reservations); both backends refuse a run on an already-exhausted, unmeasurable, or link-escaped scope and report post-run growth in `limits_hit`; per-file `fsize` ulimit live-verified. 70 new tests, including bypass attempts |
+| T8-OS | Disk exhaustion — **filesystem-wide quota** | **NOT IMPLEMENTED (out of scope)** | No cgroup/project/XFS quota or size-bounded volume is provisioned, so a *running* child is bounded by its per-file fsize limit and wall clock, not by a total-disk cap; a hardlink inside the scope also points outside it. Documented as a limitation (§5.1 of the design), not claimed as covered |
 | T9 | Fork/process bombs | **PASS** | live: PID limit blocks a fork bomb, the spawn fails cleanly and the container is reclaimed; app-level blocklist remains a fast pre-filter only |
 | T10 | Symlink / path traversal | **PASS** | app: realpath-resolving containment at use time (`services/security/path_containment.py`, Phase 0); OS: live test proves a symlink pointing outside the workspace cannot be followed across the container boundary |
 | T11 | Long-running processes outliving the request | **PASS** | live: timeout kills the container and it is reclaimed, no container survives a normal run; process backend kills the process group and the supervisor reaps the tree |
 | T12 | Host/environment inspection | **PASS** | live: minimal explicit env, host filesystem and runtime socket invisible; outputs are scrubbed before persistence |
 | T13 | Audit/outcome tampering (task writes to app DB) | **PASS** | app credentials never enter the child env (explicit env only) and no application data is mounted — the single mount is the workspace; proven live by the mount-invisibility test |
 
-### 5.1 Residual risk behind the two PARTIALs
+### 5.1 Residual risk behind the PARTIAL and the out-of-scope row
 
-1. **T4** — images are generic language images pulled by tag, so the toolchain surface is
-   whatever the image ships (`pip` present). What holds the line is the combination of
-   `--network none` (cannot fetch), read-only rootfs (cannot install into system paths),
-   non-root, `--cap-drop ALL`, and `no-new-privileges` — not a purpose-built minimal
-   image. Per-adapter minimal images are the honest fix and are not built.
-2. **T8** — the writable workspace is a host-mounted directory with no filesystem-size
-   quota. Per-write and per-file bounds exist; a total quota (project quota, loopback
-   image, or `--storage-opt size=`) does not.
+1. **T4** — images are generic language images (now digest-pinned, which fixes *which*
+   bytes run but not *how much toolchain* they carry), so the surface is whatever the
+   image ships (`pip` present). What holds the line is `--network none` (cannot fetch),
+   read-only rootfs (cannot install into system paths), non-root, `--cap-drop ALL`, and
+   `no-new-privileges` — not a purpose-built minimal image.
+2. **T8-OS** — a workspace quota is not a disk quota. Three specific gaps: (a) a running
+   child can keep writing sub-limit files until its fsize limit, wall clock, or the
+   post-run measurement stops *further* runs; (b) a hardlink planted inside the scope can
+   reference a file outside it (counted once, never double-counted, but not blocked);
+   (c) the process backend reports `fs_confinement: false`, so a child there can write
+   outside its scope entirely — the quota bounds only what it measures. Closing (a) and
+   (c) needs OS enforcement (per-container storage quota / project quota / mount
+   namespace), which this repository does not provision.
 
 ## 6. Attribution limits that were fixed during this gate
 
@@ -175,18 +197,57 @@ Recorded because they changed behaviour, not just tests:
   large` and exit 1; the limit held, and attribution now reads the child's own error text
   when fsize was enforced.
 
-## 7. Out of scope / explicitly not claimed
+## 7. Closeout controls added after the first acceptance pass
+
+Commit `42e6899`, with the design rationale in §5.1/§5.2 of
+[sandbox-design.md](sandbox-design.md).
+
+**Workspace write quota** (`services/execution/workspace_quota.py`). Two
+enforcement points, both refusing *before* bytes land where the application
+performs the write:
+
+- `fs_write` and the deliverable `finalize` write go through
+  `WorkspaceEnforcer.reserve()`, which credits the bytes a rewrite replaces and
+  holds in-flight reservations so concurrent writes cannot collectively
+  overshoot. A refusal is an audited adapter failure; content is never
+  silently truncated.
+- Both sandbox backends gate each execution: refuse when the scope is already
+  over quota, unmeasurable, or holds a link that resolves outside it; measure
+  afterwards and report growth as `disk` / `disk:<kind>` in `limits_hit` plus a
+  stderr note. The child's exit code is never rewritten into a fake quota kill.
+
+Measurement never follows a symlink, never opens a file, counts hardlinked
+inodes once, and treats an unreadable subtree as a violation. The three places
+where this cannot be a filesystem-wide quota are listed in §5.1 (T8-OS).
+
+**Immutable image pinning** (`services/execution/image_pins.py`). Approved
+tag→digest pairs live in `APPROVED_IMAGES`; a contradicting digest is refused,
+an unapproved unpinned tag is refused by default, and
+`SANDBOX_ALLOW_UNPINNED_IMAGE=1` is the documented development override that
+reports `image_pinned: false` instead of pretending. Before a container starts,
+the digest-qualified reference is pulled and that digest must appear in the
+image's `RepoDigests`; any failure is `sandbox image verification failed: …`
+with no container run. The run then uses `repo@sha256:…`, closing the retag
+window between verification and execution. The reviewed update procedure is in
+the design doc §5.2, and a unit test asserts the CI workflow pins the same
+digest the approved table names.
+
+## 8. Out of scope / explicitly not claimed
 
 - Production Docker/deployment readiness. Dockerfiles elsewhere in the repo are not
   evidence of that.
 - Windows container isolation (AppContainer/Job Objects) beyond what the process backend
   reports as enforced.
+- A filesystem-wide disk quota. The workspace write quota (T8) is enforced and tested;
+  the OS-level total-disk bound (T8-OS) is not implemented and is not claimed.
 - Any V3 capability: no Agent Action Graph, no graph executor, no new release tag.
 
-## 8. Verdict
+## 9. Verdict
 
-Every gate in §1 is green with evidence that is reproducible from the run and commit
-references above; the two PARTIALs are documented limitations rather than failures, and
-neither hides an unenforced control behind a false claim.
+Every gate in §1 is green with evidence reproducible from the run and commit references
+above. The one PARTIAL (T4) and the one explicitly out-of-scope row (T8-OS) are documented
+limitations rather than failures, and neither hides an unenforced control behind a false
+claim: the workspace quota is real and tested, and where it stops being a disk quota is
+stated in the same table that grades it.
 
 **V2 FINAL ACCEPTANCE: PASSED**
