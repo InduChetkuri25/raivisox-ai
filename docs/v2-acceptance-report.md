@@ -95,14 +95,27 @@ never counted as passes; the authoritative live evidence is §2.
 | Suite | Result |
 |---|---|
 | `tests/unit/*.py` (33 files, OneDrive-safe splits) | `512 passed, 40 skipped` |
+| sandbox suites re-run with skip reasons (`-rs`) | `128 passed, 28 skipped` (19 live, 5 POSIX-only, 4 symlink-privilege) |
 | `tests/test_live_llm.py -m live_llm` (real Ollama) | `4 passed` |
 | `apps/web`: `npx tsc --noEmit` | clean |
 | `apps/web`: `npm run build` | success |
 | `tests/integration`, `tests/e2e` | no test modules exist (0 collected) |
 
-The 40 local skips are the POSIX-only paths (rlimit-based CPU/fsize attribution, the
-process-group `/proc` cleanup assertion, Windows Job Object tests on non-Windows) plus the
-container `live` tests. Each carries an explicit skip reason.
+The 40 local skips, each with an explicit reason. Measured directly for the sandbox
+suites, where 28 of them live:
+
+```
+10  phase4  live container test skipped: no container runtime (docker/podman) on this host
+ 5  phase5  live container test skipped: no container runtime (docker/podman) on this host
+ 4  app-path live container test skipped: no container runtime (docker/podman) on this host
+ 5  POSIX-only: SIGXCPU/SIGXFSZ attribution, signal-death semantics, process groups, /proc orphan scan
+ 4  symlink creation requires privileges on this host
+```
+
+Those 19 live skips are exactly the 19 tests the Linux gate runs for real (§2.2) — the
+local skip count and the CI pass count line up one-for-one, which is the property that
+makes the split trustworthy rather than decorative. The remaining local skips outside the
+sandbox suites are host-specific (Windows-only) assertions.
 
 ## 4. What the local suite cannot prove
 
