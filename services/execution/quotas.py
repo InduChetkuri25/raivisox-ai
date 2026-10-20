@@ -145,10 +145,15 @@ class ExecutionBudget:
     cpu_seconds: float | None = None
     wall_clock_seconds: float | None = None
     max_runs: int | None = None
+    # Cumulative bytes WRITTEN across every run under this budget (churn),
+    # not the workspace's standing size — see
+    # ``services/execution/workspace_quota.py`` for the standing-size quota.
+    disk_bytes: float | None = None
 
     scope: str = "execution"
     _cpu_used: float = 0.0
     _wall_used: float = 0.0
+    _disk_used: float = 0.0
     _runs: int = 0
     _cpu_basis: str = "wall_clock"
     _started_at: float = field(default_factory=time.monotonic)
@@ -165,6 +170,10 @@ class ExecutionBudget:
     @property
     def wall_used(self) -> float:
         return self._wall_used
+
+    @property
+    def disk_used(self) -> float:
+        return self._disk_used
 
     @property
     def runs(self) -> int:
@@ -192,6 +201,9 @@ class ExecutionBudget:
         if self.cpu_seconds is not None and self._cpu_used >= self.cpu_seconds:
             raise BudgetExceeded(self.scope, self._cpu_used, self.cpu_seconds,
                                  "cpu")
+        if self.disk_bytes is not None and self._disk_used >= self.disk_bytes:
+            raise BudgetExceeded(self.scope, self._disk_used, self.disk_bytes,
+                                 "disk")
         del kind, units  # units reserved per-run are the run's own timeout
 
     def _advance_wall(self) -> None:
@@ -204,6 +216,7 @@ class ExecutionBudget:
 
     def record_usage(self, *, cpu_seconds: float | None = None,
                      wall_seconds: float | None = None,
+                     disk_bytes: float | None = None,
                      cpu_basis: str = "wall_clock",
                      runs: int = 0) -> None:
         """Consume actual units after a run completes (honest accounting)."""
@@ -215,6 +228,8 @@ class ExecutionBudget:
                 self._cpu_basis = "cpu_time"
         if wall_seconds is not None:
             self._wall_used += max(0.0, wall_seconds)
+        if disk_bytes is not None:
+            self._disk_used += max(0.0, disk_bytes)
         self._runs += runs
 
     def wall_clock_expired(self) -> bool:
@@ -231,6 +246,8 @@ class ExecutionBudget:
             "cpu_basis": self._cpu_basis,
             "wall_clock_seconds_limit": self.wall_clock_seconds,
             "wall_clock_used": round(self._wall_used, 3),
+            "disk_bytes_limit": self.disk_bytes,
+            "disk_bytes_used": round(self._disk_used, 3),
             "max_runs": self.max_runs,
             "runs": self._runs,
             "exhausted": self._exhausted_dimensions(),
@@ -244,15 +261,20 @@ class ExecutionBudget:
             out.append("wall_clock")
         if self.cpu_seconds is not None and self._cpu_used >= self.cpu_seconds:
             out.append("cpu")
+        if self.disk_bytes is not None and self._disk_used >= self.disk_bytes:
+            out.append("disk")
         return out
 
 
 class QuotaEnforcer:
     """App-layer quota walls that need no OS support.
 
-    - :meth:`check_write` bounds file writes into the workspace (T8 disk
-      exhaustion) at the point every workspace write goes through; it
-      never reads or follows the target's content — only sizes.
+    - :meth:`check_write` is the SINGLE-WRITE size cap: it bounds one
+      write and never reads or follows the target's content — only sizes.
+      The workspace's standing size, entry count, depth and symlink
+      escapes are governed by
+      :class:`services.execution.workspace_quota.WorkspaceEnforcer`, which
+      is what the integrated write path and both sandbox backends use.
     - :meth:`check_budget_expiry` converts a wall-clock budget expiry into
       the honest ``timeout`` quota vocabulary.
     """

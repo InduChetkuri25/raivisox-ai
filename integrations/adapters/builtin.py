@@ -21,6 +21,11 @@ from integrations.tools.file_reader import FileReaderTool
 from integrations.tools.file_writer import FileWriterTool
 from services.execution.sandbox import ExecutionSandbox, SandboxSpec, build_default_sandbox
 from services.execution.terminal_sandbox import TerminalSandbox
+from services.execution.workspace_quota import (
+    WorkspaceQuota,
+    WorkspaceQuotaCache,
+    WorkspaceQuotaExceeded,
+)
 from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
 
@@ -108,15 +113,37 @@ class FileReadAdapter(_WorkspaceAdapter):
 
 
 class FileWriteAdapter(_WorkspaceAdapter):
-    """Write a real file inside the workspace via FileWriterTool."""
+    """Write a real file inside the workspace via FileWriterTool.
+
+    V2 closeout (T8): the write is gated by a per-scope
+    :class:`WorkspaceQuota` BEFORE any bytes land — per-file size, workspace
+    total, entry count, path depth, and links that resolve outside the
+    scope. A refusal is an ordinary adapter failure (audited, nothing
+    written), never a silent truncation of the caller's content.
+    """
 
     id = "fs_write"
-    description = "Write a file inside the task workspace (allowlist-enforced)"
+    description = "Write a file inside the task workspace (allowlist-enforced, quota-gated)"
     kernel_permissions = ["write_files"]
 
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, quota: WorkspaceQuota | None = None):
         super().__init__(workspace)
         self._tool = FileWriterTool(allowed_directories=[self.workspace])
+        self._quota = quota if quota is not None else WorkspaceQuota.from_env()
+        self._enforcers = WorkspaceQuotaCache(self._quota)
+
+    @staticmethod
+    def _payload_bytes(content: Any) -> int:
+        """Exact byte size of the content about to be written."""
+        if isinstance(content, (bytes, bytearray)):
+            return len(content)
+        if isinstance(content, str):
+            return len(content.encode("utf-8"))
+        if content is None:
+            return 0
+        # Non-string content is not what the tool's schema allows; measure
+        # a conservative deterministic rendering rather than assuming zero.
+        return len(str(content).encode("utf-8"))
 
     async def run(self, params: dict[str, Any], ctx: AdapterContext) -> AdapterResult:
         path = str(params.get("path", "")).strip()
@@ -135,12 +162,25 @@ class FileWriteAdapter(_WorkspaceAdapter):
                 success=False, tool_id=self.id,
                 error=f"Access denied: '{path}' is outside the workspace",
             )
-        result = await self._tool.execute({
-            "path": clamped,
-            "content": content,
-            "overwrite": params.get("overwrite", True),  # retries may rewrite outputs
-            "create_directories": params.get("create_directories", True),
-        })
+        enforcer = self._enforcers.for_scope(_task_scope(self.workspace, ctx))
+        try:
+            with enforcer.reserve(clamped, self._payload_bytes(content)):
+                result = await self._tool.execute({
+                    "path": clamped,
+                    "content": content,
+                    "overwrite": params.get("overwrite", True),  # retries may rewrite outputs
+                    "create_directories": params.get("create_directories", True),
+                })
+        except WorkspaceQuotaExceeded as exc:
+            AuditTrail.instance().log(
+                actor_id=ctx.actor_id, action="tool:fs_write", resource=path,
+                allowed=False,
+                details={"reason": "workspace quota", **exc.status()},
+            )
+            return AdapterResult(
+                success=False, tool_id=self.id,
+                error=f"Workspace write refused: {exc}",
+            )
         return AdapterResult(
             success=result.success,
             tool_id=self.id,

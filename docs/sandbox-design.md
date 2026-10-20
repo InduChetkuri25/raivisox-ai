@@ -111,7 +111,7 @@ plus a hostile co-tenant task on the same host.
 | T5 | Network access from untrusted code | exfiltrate artifacts, hit 169.254.169.254 | OS | default-deny network namespace (`--network none` / unshare -n); explicit allow via proxy per policy |
 | T6 | Excessive CPU | crypto-mining in a step | OS | CPU quota per execution (cgroup/Job Object); wall-clock timeout already exists and stays |
 | T7 | Excessive memory | allocate until host OOMs | OS | hard memory cap (cgroup/Job Object); container OOM, not host OOM |
-| T8 | Disk exhaustion | write infinitely in scope | app + OS | app: per-task workspace quota enforced post-hoc + pre-execution check; OS: container filesystem size limit where supported |
+| T8 | Disk exhaustion | write infinitely in scope | app + OS | app: workspace write quota (bytes/entries/depth/escapes) enforced **before** each write + pre-run gate + post-run measurement (§5.1); OS: container filesystem size limit where supported — **not implemented**, so a running child is bounded by its per-file fsize limit and wall clock, not by a total disk quota |
 | T9 | Fork/process bombs | `:(){ :\|:& };:` | OS | PID/process-count cap (pids cgroup / Job Object); app-level blocklist remains as a fast pre-filter only |
 | T10 | Symlink / path traversal | plant symlink in scope → read host file | app + OS | app: resolve symlinks in the clamp (`realpath` semantics at *use* time, matching artifact registration); OS: rootless mount of the scope makes outside unreachable regardless |
 | T11 | Long-running processes outliving the request | daemon survives pipeline | app | process-group kill on timeout/cancel already exists; sandbox supervisor reaps the whole container/process tree on any terminal state; graceful-shutdown hook extended |
@@ -269,6 +269,84 @@ recorded so a *weaker dev boundary* is visible in results rather than
 assumed; (3) recovery behaves exactly as today (retry/re-arm), except a
 sandbox-availability failure is not retried (it will fail again); (4) no
 failure mode can leave a run `running` — existing crash backstops apply.
+
+### 5.1 Workspace write quotas — and what they are NOT
+
+`services/execution/workspace_quota.py` bounds what one task may write
+inside its own scope: total bytes, per-file bytes, entry count (files +
+directories, hidden entries included), path depth, and links that resolve
+outside the scope. Two enforcement points:
+
+- **Application writes** (`fs_write`, the deliverable `finalize` write):
+  `WorkspaceEnforcer.reserve()` checks *before* any bytes land, crediting
+  back the bytes a rewrite replaces and holding in-flight reservations so
+  concurrent writes in the process cannot collectively overshoot. A
+  refusal is an ordinary adapter failure (audited, nothing written) — the
+  caller's content is never silently truncated.
+- **Executions** (`ProcessSandbox`, `ContainerSandbox`): a pre-run gate
+  refuses a run whose scope is already over quota, unmeasurable, or holds
+  an escaping link; after the run the scope is measured again and a
+  violation is reported in `limits_hit` (`disk`, `disk:<kind>`) and in the
+  result's stderr — the child's exit code is never rewritten into a fake
+  quota kill.
+
+Measurement never follows a symlink, never opens a file (`lstat` +
+`scandir` only), counts hardlinked inodes once, treats an unreadable
+subtree as a violation (an unmeasurable scope could hide bytes), and
+flags any link whose resolution leaves the root.
+
+**This is not a filesystem-wide disk quota, and three limitations are
+explicit rather than hidden:**
+
+1. A *running* child can keep writing sub-limit files until its per-file
+   `RLIMIT_FSIZE`/`--ulimit fsize`, its wall-clock timeout, or the post-run
+   measurement stops further runs. Mid-write cumulative enforcement needs
+   an OS mechanism (per-container storage quota, project/XFS quota, a
+   size-bounded volume) that this repository does not implement.
+2. A hardlink created inside the scope that points outside it bypasses
+   "bytes live in the workspace" reasoning; hardlink creation cannot be
+   intercepted at the app layer. Inodes are counted once, so it is never
+   *double* counted, and the limitation is stated here.
+3. The quota bounds *workspace* bytes. Host disk consumed by the runtime's
+   image store, logs, or anything outside the scope is out of scope.
+
+Defaults are generous (256 MiB total, 8 MiB per file, 10k entries, depth
+32) and tunable via `SANDBOX_WORKSPACE_MAX_*`; `0`/`off` disables a
+dimension explicitly. Both sandbox backends apply the quota by default
+(`build_default_sandbox`), so no adapter can opt out silently.
+
+### 5.2 Container image pinning (supply chain)
+
+A tag is mutable: `python:3.12-slim` today is not the bytes it was last
+month, so a green gate on a tag certifies "whatever was current". The
+container backend therefore runs **immutable digests only**
+(`services/execution/image_pins.py`):
+
+- `APPROVED_IMAGES` maps an approved `repo:tag` to its digest. A
+  configured digest that contradicts the approved entry is refused
+  (typo or substitution — either way, fail).
+- A tag with no approved entry is refused by default. The documented
+  escape hatch `SANDBOX_ALLOW_UNPINNED_IMAGE=1` is reported as
+  `image_pinned: false`, so the weakening is visible in the result.
+- Before a container starts, `verify_image` pulls the
+  **digest-qualified** reference and requires that exact digest to appear
+  in the local image's `RepoDigests`. Pull failure, missing image,
+  unreadable inspect output, or a digest mismatch is an honest
+  fail-closed `sandbox image verification failed: …` — no container runs.
+- The run itself uses `repo@sha256:…`, so a retag between verification and
+  execution cannot change which bytes execute.
+
+**Approved digest update procedure (reviewed, never automatic):**
+
+1. Resolve the new manifest-list digest for the tag, e.g.
+   `curl -s https://hub.docker.com/v2/repositories/library/python/tags/3.12-slim`
+   and take the top-level `digest` field (not the per-architecture ones).
+2. Update `APPROVED_IMAGES` in `services/execution/image_pins.py` **and**
+   `SANDBOX_CONTAINER_IMAGE` in `.github/workflows/ci.yml` in the same
+   commit, with the resolution date in the comment.
+3. Run the live container gate. `tests/unit/test_image_pins.py` asserts the
+   workflow's image equals the approved entry, so a half-updated pin fails
+   locally instead of producing a gate that certified a different image.
 
 ---
 

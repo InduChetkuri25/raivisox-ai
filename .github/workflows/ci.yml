@@ -112,7 +112,12 @@ jobs:
       # The container gate runs the REAL backend with the container backend
       # selected exactly as production config would (docs/sandbox-design.md §3).
       SANDBOX_BACKEND: container
-      SANDBOX_CONTAINER_IMAGE: python:3.12-slim
+      # Digest-pinned (not a mutable tag): the gate must execute the same
+      # bytes every run. The digest is the Docker Hub manifest-list digest
+      # resolved 2026-10-20 and must match
+      # services/execution/image_pins.py::APPROVED_IMAGES — a unit test
+      # asserts the two agree, so a half-updated pin fails locally.
+      SANDBOX_CONTAINER_IMAGE: python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

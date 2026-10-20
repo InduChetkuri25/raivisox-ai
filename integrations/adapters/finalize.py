@@ -20,6 +20,11 @@ from typing import Any
 
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
 from integrations.tools.file_writer import FileWriterTool
+from services.execution.workspace_quota import (
+    WorkspaceQuota,
+    WorkspaceQuotaCache,
+    WorkspaceQuotaExceeded,
+)
 from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
 
@@ -45,10 +50,14 @@ class FinalizeAdapter(ToolAdapter):
     # fs_write — granted, not inherited.
     kernel_permissions: list[str] = ["write_files"]
 
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, quota: WorkspaceQuota | None = None):
         self.workspace = os.path.abspath(workspace)
         os.makedirs(self.workspace, exist_ok=True)
         self._writer = FileWriterTool(allowed_directories=[self.workspace])
+        # V2 closeout (T8): the deliverable write is quota-gated before any
+        # bytes land, like every other application-layer workspace write.
+        self._enforcers = WorkspaceQuotaCache(
+            quota if quota is not None else WorkspaceQuota.from_env())
 
     def _clamp(self, path: str, scope: str | None = None) -> str | None:
         """Resolve a request path against the workspace; None if outside.
@@ -99,12 +108,25 @@ class FinalizeAdapter(ToolAdapter):
                 error=f"Access denied: '{path}' is outside the workspace",
             )
 
-        result = await self._writer.execute({
-            "path": clamped,
-            "content": document,
-            "overwrite": True,  # retries legitimately rewrite the deliverable
-            "create_directories": True,
-        })
+        enforcer = self._enforcers.for_scope(scope if scope else self.workspace)
+        try:
+            with enforcer.reserve(clamped, len(document.encode("utf-8"))):
+                result = await self._writer.execute({
+                    "path": clamped,
+                    "content": document,
+                    "overwrite": True,  # retries legitimately rewrite the deliverable
+                    "create_directories": True,
+                })
+        except WorkspaceQuotaExceeded as exc:
+            AuditTrail.instance().log(
+                actor_id=ctx.actor_id, action="tool:finalize", resource=path,
+                allowed=False,
+                details={"reason": "workspace quota", **exc.status()},
+            )
+            return AdapterResult(
+                success=False, tool_id=self.id,
+                error=f"Workspace write refused: {exc}",
+            )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         if not result.success:
             return AdapterResult(

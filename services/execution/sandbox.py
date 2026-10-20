@@ -38,6 +38,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from services.execution.quotas import ExecutionBudget, SandboxQuota
+from services.execution.workspace_quota import (
+    WorkspaceEnforcer,
+    WorkspaceQuota,
+    WorkspaceQuotaExceeded,
+)
 from services.security.path_containment import contained_path, realpath_norm
 
 __all__ = [
@@ -48,7 +53,9 @@ __all__ = [
     "ProcessSandbox",
     "SandboxQuota",
     "ExecutionBudget",
+    "WorkspaceQuota",
     "process_quota_reason",
+    "build_default_sandbox",
 ]
 
 # POSIX-only signal numbers. They are absent on Windows, where subprocess
@@ -136,6 +143,24 @@ class ExecutionSandbox(Protocol):
         ...
 
 
+def _post_run_workspace(enforcer: WorkspaceEnforcer | None
+                        ) -> tuple[list[str], str]:
+    """Measure the workspace after an execution; report a violation.
+
+    Shared by both backends. Returns ``(extra_limits_hit, stderr_note)``;
+    a clean workspace yields an empty pair. The child has already exited by
+    the time this runs, so a violation is REPORTED (never converted into a
+    fake kill reason or a rewritten exit code).
+    """
+    if enforcer is None:
+        return [], ""
+    violation = enforcer.record_after_run()
+    if violation is None:
+        return [], ""
+    return (["disk", f"disk:{violation.kind}"],
+            f"[sandbox: {violation}]")
+
+
 def _truncate(text: bytes | str, limit: int) -> tuple[str, bool]:
     """Decode to text and bound it to ``limit`` characters."""
     s = text.decode(errors="replace") if isinstance(text, bytes) else str(text)
@@ -181,12 +206,18 @@ class ProcessSandbox:
     """
 
     def __init__(self, quota: SandboxQuota | None = None,
-                 budget: ExecutionBudget | None = None) -> None:
+                 budget: ExecutionBudget | None = None,
+                 workspace_quota: "WorkspaceQuota | None" = None) -> None:
         # V2 Phase 5: optional spec-level quota (required-limit enforcement)
         # and cumulative per-context budget. Both are additive; None keeps
         # the Phase 1 behavior byte-for-byte.
         self._quota = quota
         self._budget = budget
+        # V2 closeout: optional workspace write quota around each run (the
+        # child writes through the host filesystem, so the gate refuses a
+        # run that could only grow an exhausted scope and measures what the
+        # child produced afterwards).
+        self._workspace_quota = workspace_quota
         self._posix = os.name == "posix"
         self._has_resource = False
         if self._posix:
@@ -214,6 +245,9 @@ class ProcessSandbox:
             "pids_limit": False,   # Phase 1: no portable mechanism yet
             "network_deny": False, # Phase 1: needs namespace/container backend
             "fs_confinement": False,  # beyond cwd semantics: Phase 1 reports no
+            # App-layer (no OS support needed): a workspace write quota is
+            # enforced around each run when one is configured.
+            "workspace_quota": self._workspace_quota is not None,
         }
 
     # ------------------------------------------------------------------
@@ -363,8 +397,27 @@ class ProcessSandbox:
                     enforced=["spec_validation"],
                 )
 
+        # V2 closeout — workspace write quota: refuse a run whose scope is
+        # already over quota, unmeasurable, or holds a link that escapes.
+        enforcer: WorkspaceEnforcer | None = None
+        if self._workspace_quota is not None:
+            enforcer = WorkspaceEnforcer(writable, self._workspace_quota,
+                                         budget=budget)
+            try:
+                enforcer.check_before_run()
+            except WorkspaceQuotaExceeded as exc:
+                return SandboxResult(
+                    error=f"workspace quota: {exc} (refused; the run could only "
+                          "grow a scope that is already over its quota)",
+                    killed_reason="supervisor",
+                    limits_hit=["disk", f"disk:{exc.kind}"],
+                    enforced=["workspace_quota"],
+                )
+
         env = self._build_env(spec)
         enforced = ["argv_execution", "minimal_env", "working_dir", "bounded_output"]
+        if enforcer is not None:
+            enforced.append("workspace_quota")
         caps = self.capabilities()
         if spec.cpu_seconds is not None and caps["cpu_limit"]:
             enforced.append("cpu_limit")
@@ -424,14 +477,17 @@ class ProcessSandbox:
         duration_ms = int((time.monotonic() - start) * 1000)
 
         if timed_out:
+            disk_limits, disk_note = _post_run_workspace(enforcer)
             err = f"sandbox: process killed after timeout of {spec.timeout_s}s"
+            if disk_note:
+                err = f"{err}\n{disk_note}"
             return SandboxResult(
                 exit_code=None,
                 stdout="",
                 stderr=err,
                 duration_ms=duration_ms,
                 killed_reason="timeout",
-                limits_hit=["timeout"],
+                limits_hit=["timeout", *disk_limits],
                 enforced=enforced,
                 error=err,
             )
@@ -484,6 +540,13 @@ class ProcessSandbox:
         if budget is not None:
             budget.record_usage(cpu_seconds=cpu_used, cpu_basis=cpu_basis,
                                 runs=1)
+
+        # V2 closeout — workspace measurement after the child exited; a
+        # violation is reported, never used to rewrite the exit code.
+        disk_limits, disk_note = _post_run_workspace(enforcer)
+        limits_hit.extend(disk_limits)
+        if disk_note:
+            err = (err + "\n" + disk_note).strip()
 
         return SandboxResult(
             exit_code=proc.returncode,
@@ -586,12 +649,15 @@ def build_default_sandbox() -> ExecutionSandbox:
       error, not a license to pick another backend.
     """
     backend = os.environ.get("SANDBOX_BACKEND", "process").strip().lower()
+    # V2 closeout: workspace write quotas are on by default (generous
+    # defaults; SANDBOX_WORKSPACE_* tunes them, 0/off disables explicitly).
+    workspace_quota = WorkspaceQuota.from_env()
     if backend == "process":
-        return ProcessSandbox()
+        return ProcessSandbox(workspace_quota=workspace_quota)
     if backend == "container":
         from services.execution.container_sandbox import ContainerSandbox
 
-        return ContainerSandbox()
+        return ContainerSandbox(workspace_quota=workspace_quota)
     raise ValueError(
         f"invalid SANDBOX_BACKEND {backend!r}: expected 'process' or 'container'"
     )

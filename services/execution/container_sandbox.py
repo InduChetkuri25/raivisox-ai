@@ -72,6 +72,7 @@ import sys
 import time
 import uuid
 
+from services.execution.image_pins import resolve_pinned_ref, verify_image
 from services.execution.sandbox import (
     ExecutionBudget,
     ExecutionSandbox,
@@ -79,6 +80,12 @@ from services.execution.sandbox import (
     SandboxResult,
     SandboxSpec,
     _ALLOWED_ENV_KEYS,
+    _post_run_workspace,
+)
+from services.execution.workspace_quota import (
+    WorkspaceEnforcer,
+    WorkspaceQuota,
+    WorkspaceQuotaExceeded,
 )
 from services.security.path_containment import contained_path
 
@@ -118,6 +125,8 @@ _CAP_KEYS = (
     "cap_drop_all",
     "no_new_privileges",
     "runtime_available",
+    "image_pinned",
+    "workspace_quota",
 )
 
 # Probe cache: (monotonic ts, executable-or-None, reason-if-None)
@@ -410,11 +419,17 @@ class ContainerSandbox:
     def __init__(self, image: str | None = None, python_bin: str | None = None,
                  user: str | None = None,
                  quota: "SandboxQuota | None" = None,
-                 budget: "ExecutionBudget | None" = None) -> None:
+                 budget: "ExecutionBudget | None" = None,
+                 workspace_quota: WorkspaceQuota | None = None) -> None:
         # V2 Phase 5: optional spec-level quota + cumulative budget, same
         # gates as the process backend (additive; None keeps Phase 4 exact).
         self._quota = quota
         self._budget = budget
+        # V2 closeout: workspace write quota around every execution (the
+        # container's bind mount cannot be intercepted mid-write, so the
+        # gate refuses a run that could only grow an exhausted scope and
+        # measures what the child produced afterwards).
+        self._workspace_quota = workspace_quota
         self._image = (image or os.environ.get("SANDBOX_CONTAINER_IMAGE",
                                                "").strip() or DEFAULT_IMAGE)
         self._python_bin = (python_bin if python_bin is not None
@@ -448,7 +463,16 @@ class ContainerSandbox:
             "cap_drop_all": True,
             "no_new_privileges": True,
             "runtime_available": True,
+            # Honest: True only when the configured reference resolves to an
+            # approved immutable digest (the unpinned dev override yields a
+            # tag reference, which is not pinned).
+            "image_pinned": self._image_is_pinned(),
+            "workspace_quota": self._workspace_quota is not None,
         }
+
+    def _image_is_pinned(self) -> bool:
+        pinned, _note = resolve_pinned_ref(self._image)
+        return pinned is not None and "@" in pinned
 
     def _enforced_for(self, spec: SandboxSpec) -> list[str]:
         """What THIS run will actually pass to the runtime."""
@@ -513,6 +537,27 @@ class ContainerSandbox:
         if err is not None:
             return err
 
+        # 1b) Workspace write quota (V2 closeout): refuse a run whose scope
+        #     is already over quota, unmeasurable, or contains a link that
+        #     escapes — a container started anyway could only make it worse.
+        #     The bind mount cannot be intercepted mid-write, so this is the
+        #     honest maximum at this layer (see workspace_quota module doc).
+        writable = os.path.abspath(spec.workspace_writable or spec.cwd)
+        enforcer: WorkspaceEnforcer | None = None
+        if self._workspace_quota is not None:
+            enforcer = WorkspaceEnforcer(writable, self._workspace_quota,
+                                         budget=budget)
+            try:
+                enforcer.check_before_run()
+            except WorkspaceQuotaExceeded as exc:
+                return SandboxResult(
+                    error=f"workspace quota: {exc} (refused; the run could only "
+                          "grow a scope that is already over its quota)",
+                    killed_reason="supervisor",
+                    limits_hit=["disk", f"disk:{exc.kind}"],
+                    enforced=["workspace_quota"],
+                )
+
         # 2) Runtime availability — fail-closed. No ProcessSandbox
         #    substitution exists anywhere in this path.
         exe, reason = await asyncio.to_thread(probe_runtime)
@@ -523,12 +568,30 @@ class ContainerSandbox:
                 enforced=[],
             )
 
+        # 2b) Image pinning (fail closed): resolve to an approved immutable
+        #     digest, pull THAT reference, and require the local image's
+        #     RepoDigests to contain it. The container runs by digest, so a
+        #     tag retag mid-run cannot change which bytes execute.
+        pinned_image, pin_err = await asyncio.to_thread(
+            verify_image, exe, self._image,
+        )
+        if pinned_image is None:
+            return SandboxResult(
+                error=f"sandbox image verification failed: {pin_err}",
+                killed_reason="supervisor",
+                enforced=["spec_validation"],
+            )
+
         name = f"raivisox-sbx-{uuid.uuid4().hex[:12]}"
         cmd = build_run_argv(
-            spec, runtime_exe=exe, image=self._image, user=self._user,
+            spec, runtime_exe=exe, image=pinned_image, user=self._user,
             python_bin=self._python_bin, container_cwd=container_cwd, name=name,
         )
         enforced = self._enforced_for(spec)
+        if enforcer is not None:
+            enforced.append("workspace_quota")
+        if "@" in pinned_image:
+            enforced.append("image_pinned")
 
         start = time.monotonic()
         proc: asyncio.subprocess.Process | None = None
@@ -576,14 +639,17 @@ class ContainerSandbox:
                 if budget is not None:
                     budget.record_usage(cpu_seconds=duration_ms / 1000.0,
                                         cpu_basis="wall_clock", runs=1)
+                disk_limits, disk_note = _post_run_workspace(enforcer)
                 err = f"sandbox: process killed after timeout of {spec.timeout_s}s"
+                if disk_note:
+                    err = f"{err}\n{disk_note}"
                 return SandboxResult(
                     exit_code=None,
                     stdout="",
                     stderr=err,
                     duration_ms=duration_ms,
                     killed_reason="timeout",
-                    limits_hit=["timeout"],
+                    limits_hit=["timeout", *disk_limits],
                     enforced=enforced,
                     error=err,
                 )
@@ -621,6 +687,14 @@ class ContainerSandbox:
                 limits_hit.append(killed_reason)
                 if suffix:
                     er = (er + "\n" + suffix).strip()
+
+            # V2 closeout — workspace measurement after the child exited: the
+            # bind mount cannot be policed mid-write, so what the child
+            # actually produced is reported honestly instead of assumed.
+            disk_limits, disk_note = _post_run_workspace(enforcer)
+            limits_hit.extend(disk_limits)
+            if disk_note:
+                er = (er + "\n" + disk_note).strip()
 
             # V2 Phase 5 — budget accounting after the run. The host cannot
             # read the container's rusage cheaply, so wall duration is the
