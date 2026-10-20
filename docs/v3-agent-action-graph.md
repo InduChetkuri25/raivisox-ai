@@ -110,6 +110,10 @@ typecheck + build).
 - **No ML/embedding-based risk scoring.** Every number is a rule with a stated reason.
 - **No cross-tenant/org model.** Isolation stays per-user (§9).
 - **No policy DSL / OPA.** Structured policy rows only; a DSL is an open question (§15).
+- **No change to the V2 execution controls.** Kernel authorization, sandbox flags and
+  required-limit gates, workspace quotas, and image digest verification (including its
+  fail-closed behaviour on hosts without registry access) are untouched. Graph policy is
+  evaluated after them and cannot override, relax, or bypass any of them (§7.2).
 
 ---
 
