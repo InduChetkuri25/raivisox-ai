@@ -4,12 +4,19 @@
 been implemented, migrated, or tested; the test matrix below is a *plan*, not results.
 
 Implements the Phase 1 milestone of [v3-agent-action-graph.md](v3-agent-action-graph.md)
-(§5, §13 Phase 1). Baseline inspected: commit `5e2ca57` on `main`, clean working tree,
+(§5, §13 Phase 1). Baseline inspected: commit `4a4a3fc` on `main`, clean working tree,
 only tag `v1.0.0` → `74e2c1d6a99a06b064ef6486f337892818961fb6`.
 
-Marker used throughout: **[OWNER APPROVAL REQUIRED]** — the proposal changes an interface or
-a stored schema in a way the repo owner should sign off before implementation. All of them
-are collected in §11.2.
+**Decision status: all 12 owner decisions are resolved** — classified as
+`RESOLVED — SECURE DEFAULT` or `RESOLVED — EXISTING CONTRACT`, each with its reason,
+consequences, tests and compatibility impact in §11.2–§11.3. No decision blocks Phase 1.
+Three gates still require explicit human approval, and none blocks implementation: enabling
+events in a real deployment (§11.4 G1), the Phase 2 retention value (G2), and whether real
+users may hold `ADMIN` (G3).
+
+Inline tags `D1`–`D12` refer to the decision record; every tag in the body resolves to a row
+in §11.2. A resolution here is an architect decision under the stated principles, not a
+claim that a human signed it off.
 
 ---
 
@@ -22,15 +29,17 @@ nothing that consumes it:
 
 1. One new append-only table, `graph_events`, with a closed event-type set, deterministic
    idempotency keys, a payload allowlist, and a payload hash.
-2. Additive **audit linkage**: nullable `user_id`, `task_id`, `run_id`, `step_node_id`,
-   `action_id` columns on `audit_events`, populated for new rows only.
+2. Additive **audit linkage** in a new side table, `audit_links` (`event_id`, `user_id`,
+   `task_id`, `run_id`, `step_node_id`, `action_id`), populated for new rows only. No
+   existing table is altered (D2).
 3. Emission at five existing choke points: `AdapterRegistry.run` (tool lifecycle),
    `FileReadAdapter` (successful and denied reads), `FileWriteAdapter` (committed and
    denied writes), `HttpGetAdapter` (endpoint attempt/success/denial), and
    `_register_task_artifact` (verified write).
 4. Trusted identity plumbing: one per-run provenance handle, validated against the
    database once per run, carried in `AdapterContext`.
-5. Alembic revision `003` plus an `init_db()` compatibility guard, and tests.
+5. Alembic revision `003` (two new tables, no `ALTER` on any existing table, no `init_db`
+   shim) and the acceptance tests of §9.
 
 ### 1.2 Non-goals (explicit)
 
@@ -45,7 +54,8 @@ nothing that consumes it:
 - **No change to any existing control**: kernel authorization, sandbox flags, required-limit
   gates, workspace quotas, digest verification, offline fail-closed behaviour, audit
   semantics, pipeline control flow.
-- **No retention/cleanup job** for the new table — deferred to Phase 2 **[OWNER APPROVAL REQUIRED — D9]**.
+- **No retention/cleanup job** for the new table — deferred to Phase 2 by design §15.2 item 6
+  and D9; see §11.4 G2 for the retention gate.
 
 ### 1.3 The authority invariant (Phase 1 form)
 
@@ -159,7 +169,11 @@ Why `seq` is the primary key: it is the only total order that survives concurren
 execution and restarts, and it makes the projection cursor (§Phase 2) a single integer. Why
 `Integer` rather than `BigInteger`: SQLite only auto-increments an `INTEGER PRIMARY KEY`;
 `BigInteger` would silently stop auto-incrementing there while the zero-drift test still
-passes. The 2³¹ ceiling (~2.1B events) is documented in §11.1 R8. **[OWNER APPROVAL REQUIRED — D6]**
+passes. The 2³¹ ceiling (~2.1B events) is acceptable **at the design's own volume estimate**:
+design §10 assumes 1000 tasks/day at 6–12 events/step over ~10 steps, i.e. ≤ 120k events/day,
+so the ceiling is ≈ 49 years of continuous operation; R8 records the trigger for a future
+migration. Carried as `RESOLVED — EXISTING CONTRACT` (D6): the design specifies a
+"DB-assigned monotonic integer", and every integer column in this repo is `Integer`.
 
 **`seq` values must never be reused.** A plain SQLite `INTEGER PRIMARY KEY` assigns
 `max(rowid)+1`, so deleting the newest rows (a task delete cascades its events) would let the
@@ -214,13 +228,16 @@ only inserts (§9 T15b).
 | 6 | `resource.read.observed` | `FileReadAdapter` after the tool returns (success **or** tool-level error) | `executed` \| `failed` | observed | yes |
 | 7 | `resource.read.denied` | `FileReadAdapter` when the workspace clamp refuses | `denied` | observed | yes |
 | 8 | `resource.write.committed` | `FileWriteAdapter` after a successful tool write | `executed` | observed | yes |
-| 9 | `resource.write.denied` | `FileWriteAdapter` on clamp or workspace-quota refusal | `denied` | observed | **proposed addition — D3** |
+| 9 | `resource.write.denied` | `FileWriteAdapter` on clamp or workspace-quota refusal | `denied` | observed | **reviewed addition — D3 resolved** |
 | 10 | `endpoint.connect.attempted` | `HttpGetAdapter` after URL validation, before the request | `attempted` | observed | yes |
 | 11 | `endpoint.connect.succeeded` | after a 2xx text response is accepted | `executed` | observed | yes |
 | 12 | `endpoint.connect.denied` | validation/allowlist/SSRF/policy refusal before any byte | `denied` | observed | yes |
 | 13 | `artifact.registered` | `_register_task_artifact` after the row commits | `executed` | **verified** | yes (§5.1) |
 
-`capability.granted` is **deliberately deferred to Phase 2** — **[OWNER APPROVAL REQUIRED — D4]**: kernel grants are global to service actors, have no user or task subject, and
+`capability.granted` is **deliberately deferred to Phase 2** — D4 resolved as
+`EXISTING CONTRACT` (design §13 Phase 1 acceptance covers kernel decisions and adapter
+invocations only; the type stays in the design's closed set for Phase 2): kernel grants are
+global to service actors, have no user or task subject, and
 forcing them into a table whose `user_id` is `NOT NULL` would either weaken the isolation
 invariant or require synthetic users. Note the deliberate asymmetry with the per-event
 "attempted / allowed / denied / executed / failed" split explained in §3.8: that is the
@@ -229,8 +246,9 @@ non-user subject is the correct shape.
 
 `resource.write.denied` does not exist in the design's closed set. It is proposed because a
 write can be refused **after** the kernel allowed it (workspace clamp, quota), and without
-this type a refusal is only a free-text `tool.failed` error. **[OWNER APPROVAL REQUIRED — D3]** If rejected, the fallback is `tool.failed` with `payload.denial_kind` — weaker
-for analysis (string-derived), so the recommendation is to add the type.
+this type a refusal is only a free-text `tool.failed` error. D3 = `RESOLVED — SECURE DEFAULT`:
+the type is added (a reviewed addition under design §5.2), because a quota/clamp refusal is
+not an adapter failure and must not be recorded as one.
 
 ### 3.4 Outcome vocabulary and invariants
 
@@ -363,55 +381,87 @@ event site; `recorded_at` is the insert clock. Neither is ever used for ordering
 
 ### 5.1 Audit linkage (gap 1)
 
-**Schema:** five nullable columns on `audit_events` — `user_id VARCHAR(36)`, `task_id
-VARCHAR(36)`, `run_id VARCHAR(36)`, `step_node_id VARCHAR(64)`, `action_id VARCHAR(36)` —
-plus `ix_audit_events_task_id (task_id)`. **[OWNER APPROVAL REQUIRED — D2]** (alternative
-considered: a separate `audit_links` table; rejected for Phase 1 because every audit read
-would need a join and the columns are purely additive).
+**Schema (D2 = `RESOLVED — EXISTING CONTRACT`): a new side table, not new columns.** Design
+§13 Phase 1 mandates an additive migration with "no changes to existing tables", and
+`audit_events` is forensic evidence that V2 tooling already reads. Adding five columns would
+edit that table's shape; the side table leaves it byte-identical. The earlier column
+recommendation is therefore withdrawn.
+
+`audit_links`:
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `event_id` | string(64) PK | no | FK → `audit_events.event_id` (unique), `ON DELETE CASCADE`; exactly one link row per audit row |
+| `user_id` | string(36) | yes | owning user; NULL only for audit paths with no task subject |
+| `task_id` | string(36) | yes | historical task id; **deliberately no FK** — deleting a task must not erase audit linkage |
+| `run_id` | string(36) | yes | `execution_runs.id` |
+| `step_node_id` | string(64) | yes | pipeline node id (`step-N`) |
+| `action_id` | string(36) | yes | tool invocation |
+
+Indexes (names fixed, because the zero-drift test compares them): `ix_audit_links_user_id`,
+`ix_audit_links_task_id`, `ix_audit_links_run_id`, `ix_audit_links_action_id`. No link row is
+written when every linkage field would be null (those rows are genuinely unattributed, §5.8).
 
 **Code path (all additive, all defaulted).** The kernel builds its `ActionContext`
 *internally* in `authorize_and_log`, so the linkage has to travel through it — this is the
 exact shape the current code requires:
 
-1. `AuditEvent` dataclass gains the five optional fields (default `None`); `to_dict()`
-   includes them (so in-memory reads and persisted reads agree).
+1. `AuditEvent` dataclass gains five optional fields (default `None`); `to_dict()` includes
+   them (so in-memory reads and persisted reads agree).
 2. `AuditTrail.log(...)` gains keyword-only `user_id=None, task_id=None, run_id=None,
    step_node_id=None, action_id=None` and passes them into the event.
-3. `AuditTrail.flush_pending` writes them to the five columns (existing per-`event_id`
-   idempotency and `resource[:500]` truncation unchanged).
-4. `AuditTrail.read_from_db` returns them (additive keys; legacy rows return `None`).
+3. `AuditTrail.flush_pending` inserts the `AuditEventModel` row **and**, when any linkage
+   field is set, the `AuditLinkModel` row in the **same transaction** (existing per-`event_id`
+   idempotency and `resource[:500]` truncation unchanged). A failure rolls back both and the
+   events stay pending, so no audit row is ever persisted without the link that was meant to
+   accompany it, and no link can reference a missing audit row. The existing crash window is
+   safe: a crash after commit but before dequeue is caught by the `event_id`-exists check on
+   the next flush, so a duplicate link is never attempted (its PK would otherwise raise).
+4. `AuditTrail.read_from_db` left-joins `audit_links` and returns the same keys plus the five
+   linkage keys (`None` when no link row exists).
 5. `ActionContext` gains the same five optional fields; `SecurityKernel.authorize_and_log`
    gains the same keyword-only parameters, passes them into `ActionContext`, and
    `record_audit` forwards them to `AuditTrail.log`. `authorize()` itself is untouched —
    linkage is evidence, never an input to the decision.
 6. `SecurityDecision` gains `request_id: str = ""`, populated by `authorize_and_log` from
-   the `ActionContext` it created. Today the generated `request_id` is written to the audit
-   row and then discarded, so an event cannot cite its audit row; exposing it is what makes
-   `correlation_id` real instead of invented. Additive, defaulted.
-   **[OWNER APPROVAL REQUIRED — D12]**
+   the `ActionContext` it created (D12 = `RESOLVED — EXISTING CONTRACT`: design §4.4/§5.1
+   require `correlation_id = kernel request_id`, and today that id is written to the audit row
+   then discarded, so the correlation could not be honoured without this field). Additive,
+   defaulted, no behaviour change.
 7. `AdapterRegistry.run` supplies the linkage from `ctx` (`user_id`, `task_id`,
    `execution_run_id` → `run_id`, `step_id` → `step_node_id`, plus the new `action_id`) and
    uses `decision.request_id` as `correlation_id` on the tool events.
 
-**Backward compatibility:** legacy rows keep `NULL` (never backfilled, never fabricated). The
-`/api/v1/audit` response gains five keys whose values are `null` for legacy rows — an
-additive change; the existing tests that read `event_id/actor_id/action/allowed` continue to
-pass. No column is renamed, dropped, or made non-null.
+**Backward compatibility:** existing `audit_events` rows are untouched and have no link row,
+so the five keys read as `null` for them (never backfilled, never fabricated). The audit
+table's shape is unchanged, so any existing forensic query or external reader keeps working.
+`/api/v1/audit` returns a plain dict (no response model), so five added nullable keys are
+non-breaking; the existing tests that read `event_id/actor_id/action/allowed` continue to
+pass.
+
+**FK honesty:** this repo does not enable `PRAGMA foreign_keys` on SQLite, so FKs are
+enforced by PostgreSQL and merely *declared* on SQLite. The link/row invariant therefore rests
+on the single-transaction write above, not on the FK — and the tests assert the transaction
+behaviour, not the constraint.
 
 ### 5.2 Emission points (exactly five, all existing choke points)
 
 | # | Point (file:function) | Events | When | Identity source |
 |---|---|---|---|---|
 | 1 | `integrations/adapters/registry.py::AdapterRegistry.run` | `tool.attempted`, `tool.allowed`, `tool.denied`, `tool.executed`, `tool.failed` | before the kernel decision; after the decision; after `adapter.run` | `ctx` (actor/task/run/step) + registry `action_id` |
-| 2 | `integrations/adapters/builtin.py::FileReadAdapter.run` | `resource.read.observed` (`executed`/`failed`), `resource.read.denied` | after clamp; after the tool returns | `ctx` + `action_id` passed via `ctx.extra["v3_action_id"]` |
+| 2 | `integrations/adapters/builtin.py::FileReadAdapter.run` | `resource.read.observed` (`executed`/`failed`), `resource.read.denied` | after clamp; after the tool returns | `ctx` + `ctx.action_id` (typed field, D10) |
 | 3 | `integrations/adapters/builtin.py::FileWriteAdapter.run` | `resource.write.committed`, `resource.write.denied` | after quota/clamp; after the tool returns | `ctx` + same `action_id` |
 | 4 | `integrations/adapters/http_get.py::HttpGetAdapter.run` | `endpoint.connect.attempted`, `.succeeded`, `.denied` | after URL validation, before the request; after the response; on refusal | `ctx` + `action_id` |
 | 5 | `apps/api/app/main.py::_register_task_artifact` | `artifact.registered` | after the artifact row commits | `task_id`, `user_id` resolved from the task row, plus the run id passed in |
 
-How the adapter knows its `action_id`: the registry sets `ctx.extra["v3_action_id"]` before
-calling `adapter.run` (one dict write on an object it already owns; adapters read it
-defensively and emit nothing when absent). This avoids changing the `run(params, ctx)`
-signature or `AdapterResult`. **[OWNER APPROVAL REQUIRED — D10]**
+How the adapter knows its `action_id` (D10 = `RESOLVED — SECURE DEFAULT`): a **typed,
+defaulted `action_id` field on `AdapterContext`**, set by the registry immediately before
+`adapter.run`. The alternative (`ctx.extra["v3_action_id"]`) is rejected because `extra` is an
+untyped grab-bag with no production consumer today (`grep` shows zero non-test uses), so a
+dict key would be the weakest possible carrier for provenance: no type, no default, no
+discoverability, and every future caller free to write the same key. The typed field keeps
+`run(params, ctx)` and `AdapterResult` unchanged, and adapters still emit nothing when it is
+empty. The anti-spoof check remains a live-registry-set membership test (§6.4).
 
 ### 5.3 `fs_read` (gap 2)
 
@@ -446,9 +496,11 @@ Notes:
 
 - Success ⇒ `resource.write.committed` (`bytes`, `created`/`overwritten` derived from the
   tool output when present, `relpath`) + a **new** success audit entry
-  (`action="tool:fs_write", allowed=True`). The audit success entry is added for symmetry
-  with reads; it carries no content, and it is a real increase in `audit_events` row count.
-  **[OWNER APPROVAL REQUIRED — D11]**
+  (`action="tool:fs_write", allowed=True`). D11 = `RESOLVED — SECURE DEFAULT`: a write
+  changes state, so an auditor restricted to `audit_events` must be able to see that it
+  happened, not only that some writes were refused; the asymmetry (denials recorded, successes
+  not) is an evidence hole. The entry carries no content. Cost: one extra audit row per
+  successful write, batched by the existing flusher; it does not replace the graph event.
 - Clamp refusal / `WorkspaceQuotaExceeded` ⇒ `resource.write.denied` (`reason:
   outside_workspace | quota`, `bytes`, `quota_kind` when available). The existing audit
   denial entries are unchanged.
@@ -474,7 +526,7 @@ adapter = self.get(adapter_id)
 action_id = uuid4()
 provenance = provenance_from(ctx)          # None when ctx lacks user/run
 if provenance: emit tool.attempted(outcome=attempted, action_id, tool_id=adapter.id)
-ctx.extra["v3_action_id"] = action_id       # only set, never trusted for identity
+ctx.action_id = action_id                  # typed field; never trusted for identity
 correlation = None
 if adapter.kernel_permissions:
     decision = kernel.authorize_and_log(
@@ -510,18 +562,19 @@ so a denied invocation has no `executed`/`failed` sibling (§3.4).
 `artifact.registered` with `evidence_class="verified"`, `payload={artifact_id, sha256,
 size_bytes, filename}`, `target_id="res:<task>/<relpath>"`. `user_id` is resolved from the
 `tasks` row (one primary-key lookup, already inside the function's transaction scope) — never
-from the caller. **[OWNER APPROVAL REQUIRED — D7]** (it extends the design's Phase 1 file
-list by one function in `main.py`).
+from the caller. D7 = `RESOLVED — EXISTING CONTRACT` (design §4.3 requires this event for the
+`verified` `writes` edge; it extends the design's Phase 1 file list by one function in
+`main.py`).
 
 ### 5.8 Legacy and unprovenanced behaviour
 
 | Situation | Behaviour |
 |---|---|
-| Existing `audit_events` rows | New columns `NULL`; all existing reads/endpoints unchanged |
-| Audit denial logged by an adapter that has no `ctx` linkage (none today) | Linkage columns `NULL`, as legacy |
-| Adapter invoked directly (tests, scripts) without a provenance-bearing `ctx` | **No** `graph_events` row; `graph_events_skipped_no_provenance` increments. Skipping rather than storing an unattributed row is a proposal awaiting sign-off **[OWNER APPROVAL REQUIRED — D8]** |
+| Existing `audit_events` rows | No `audit_links` row, so the five keys read `null`; the table itself is unchanged, and all existing reads/endpoints behave identically |
+| Audit row written by a path with no task subject (e.g. an API admin action) | `user_id` may be set, `task_id`/`run_id` `null`; linkage is partial by fact, not by omission |
+| Adapter invoked directly (tests, scripts) without a provenance-bearing `ctx` | **No** `graph_events` row; `graph_events_skipped_no_provenance` increments. D8 = `RESOLVED — EXISTING CONTRACT` (design §4.4: `user_id` is `NOT NULL`; design §11.1: missing evidence is `unknown`, never invented). Counting keeps the gap visible instead of silent |
 | Pipeline run | Full linkage; every tool invocation produces at least `tool.attempted` + one terminal event |
-| `V3_EVENTS_ENABLED` unset/false | No events at all; zero new DB writes; existing behaviour byte-for-byte. Default **off** is a proposal awaiting sign-off **[OWNER APPROVAL REQUIRED — D5]** |
+| `V3_EVENTS_ENABLED` unset/false | No events at all; zero new DB writes; existing behaviour byte-for-byte. D5 = `RESOLVED — EXISTING CONTRACT`: design §13 Phase 1 fixes the flag's name and "default off"; the new tests set it explicitly, so default-off does not reduce coverage in CI |
 
 ### 5.9 What Phase 1 still cannot observe (stated, not papered over)
 
@@ -568,11 +621,11 @@ process cannot observe from inside a killed step.
 | `run_id` | `execution_run.id` created by `run_task_pipeline` | params, events payloads |
 | `step_node_id` | pipeline `node_id` (`step-N`) | params |
 | `tool_id` | `adapter.id` (registry state) | `params["tool"]` |
-| `action_id` | registry-generated uuid4 | any caller input |
+| `action_id` | registry-generated uuid4, published on `AdapterContext` only after generation | any caller input, `ctx.extra`, `params` |
 
-### 6.2 `AdapterContext` extension **[OWNER APPROVAL REQUIRED — D1]**
+### 6.2 `AdapterContext` extension (D1 = `RESOLVED — SECURE DEFAULT`)
 
-Add two defaulted fields:
+Add three defaulted fields:
 
 ```python
 @dataclass
@@ -585,7 +638,15 @@ class AdapterContext:
     extra: dict[str, Any] = field(default_factory=dict)
     user_id: str = ""            # NEW: owning user (trusted, set by the pipeline)
     execution_run_id: str = ""   # NEW: first-class run id (trusted, set by the pipeline)
+    action_id: str = ""          # NEW: this invocation's id (set by the registry, D10)
 ```
+
+Why this is the secure default rather than `ctx.extra`: the provenance invariant is that
+identity and action ids come from the **trusted execution context**. A typed field is set in
+one place, has a visible default, is covered by the dataclass' own validation surface, and
+cannot be confused with adapter-specific scratch data; `extra` is untyped, currently unused
+in production code, and would let any caller pre-populate a look-alike key. Typing does not
+replace the anti-spoof check (§6.4) — it removes a class of confusion before that check runs.
 
 All 23 existing construction sites keep working. `_build_worker` gains `user_id` and
 `execution_run_id` parameters; its single pipeline call site (`main.py`, inside the step
@@ -626,17 +687,21 @@ path.
    so a caller cannot smuggle an identity field through an arbitrary dict.
 2. Adapters never pass identity; they pass only `tool_id`, target, outcome and payload. The
    registry supplies `action_id`; the handle supplies identity.
-3. `ctx.extra["v3_action_id"]` is written by the registry *after* it generates the id, and
-   adapters treat it as untrusted input: the writer validates that the `action_id` it
-   receives **matches the action_id the registry registered for this invocation** (a
-   per-process set of live action ids) before accepting an adapter-level event.
+3. `ctx.action_id` is written by the registry *after* it generates the id, and adapters
+   treat it as untrusted input: the writer validates that the `action_id` it receives
+   **matches the action_id the registry registered for this invocation** (a per-process set
+   of live action ids) before accepting an adapter-level event. An adapter that overwrites
+   the field with an id the registry never issued is refused (T16).
 4. Nothing in the graph writer reads `params`, `request.body`, or environment variables.
 5. `user_id` is never accepted from a request path: no Phase 1 API exists.
 
 ### 6.5 Cross-user invariants
 
-- `user_id` is denormalized from the task row, and `task_id` has a DB foreign key, so a row
-  can only reference a real task.
+- `user_id` is denormalized from the task row and validated against it at run start, so a
+  row cannot claim a user the task does not belong to. `task_id` also has a DB foreign key;
+  note that SQLite in this repo runs without `PRAGMA foreign_keys`, so the FK is enforced on
+  PostgreSQL and declared-only on SQLite — the guarantee is the run-start validation plus the
+  FK where it is enforced, never the FK alone.
 - The writer refuses (`ProvenanceError`, no row) if a supplied `user_id` differs from
   `tasks.user_id` — exercised by a test that forges the user id.
 - All future reads filter on `user_id`; Phase 1 adds no read API, so no read path can leak
@@ -644,9 +709,10 @@ path.
 
 ### 6.6 Legacy compatibility
 
-Legacy audit rows (`NULL` linkage) remain readable and are never reclassified. Legacy
-`task_events` are untouched. No pre-V3 graph events exist and **no backfill** synthesizes
-them from audit or artifacts (that would fabricate provenance).
+Legacy audit rows stay exactly as they are: each keeps its place in `audit_events` and simply
+has no `audit_links` row, so its linkage reads `null` and is never reclassified, guessed, or
+backfilled. Legacy `task_events` are untouched. No pre-V3 graph events exist and **no
+backfill** synthesizes them from audit rows or artifacts (that would fabricate provenance).
 
 ---
 
@@ -654,50 +720,53 @@ them from audit or artifacts (that would fabricate provenance).
 
 ### 7.1 Is a migration needed? Yes
 
-Two additions: the `graph_events` table and five nullable `audit_events` columns.
+Two **new tables** and no alterations to anything existing: `graph_events` (§3.1) and
+`audit_links` (§5.1). This is exactly the shape design §13 Phase 1 requires:
+"additive table + indexes; no changes to existing tables".
 
-### 7.2 Revision `003` (`apps/api/alembic/versions/003_graph_events_audit_linkage.py`)
+### 7.2 Revision `003` (`apps/api/alembic/versions/003_graph_events_audit_links.py`)
 
 - `revision = "003"`, `down_revision = "002"`.
 - `upgrade()`:
-  1. `op.create_table("graph_events", ...)` with the columns/constraints of §3.1.
-  2. `op.create_index(...)` for the five indexes.
-  3. `with op.batch_alter_table("audit_events") as b:` add `user_id`, `task_id`, `run_id`,
-     `step_node_id`, `action_id` (all `sa.String(...)`, `nullable=True`) — batch mode so
-     SQLite (which cannot `ALTER TABLE … DROP COLUMN` in older versions) supports the
-     downgrade.
-  4. `op.create_index("ix_audit_events_task_id", "audit_events", ["task_id"])`.
-- `downgrade()`: drop the audit index, batch-drop the five columns, drop the five graph
-  indexes, drop the table.
-- No data migration, no backfill, no column type changes on existing tables.
+  1. `op.create_table("graph_events", ...)` with the columns/constraints of §3.1
+     (`sqlite_autoincrement=True` on the table for the `seq` non-reuse guarantee).
+  2. `op.create_index(...)` for the five `graph_events` indexes.
+  3. `op.create_table("audit_links", ...)` with the columns/PK/FK of §5.1.
+  4. `op.create_index(...)` for the four `audit_links` indexes.
+- `downgrade()`: drop the four `audit_links` indexes, drop `audit_links`, drop the five
+  `graph_events` indexes, drop `graph_events`.
+- **No** `ALTER TABLE`, no data migration, no backfill, no type change on an existing table.
 - Index names: all ≤ 63 characters (Postgres identifier limit), all lowercase.
 
-### 7.3 `init_db()` compatibility guard
+### 7.3 `init_db()` — no compatibility guard is needed
 
-`create_all` cannot add columns to an existing `audit_events` table, so — following the
-existing `_ensure_outcome_column` / `_ensure_task_event_run_column` pattern — add
-`_ensure_audit_linkage_columns(sync_conn)` that inspects the table and issues
-`ALTER TABLE audit_events ADD COLUMN …` for any missing linkage column. `graph_events` is
-created by `create_all` automatically, so it needs no guard (but the writer must still treat
-"table missing" as a no-op failure, §8).
+Because no existing table is altered, the `_ensure_outcome_column`-style ALTER guard the
+earlier draft required is **removed from the plan**: `Base.metadata.create_all` creates both
+new tables on a fresh database and on a pre-existing one, and there is nothing for an ALTER
+shim to add. The writers still treat a missing table as a non-fatal condition (§8), so a
+deployment that runs new code against an un-migrated database loses events, not execution.
 
 ### 7.4 Model registration and the zero-drift test
 
-- New model `apps/api/app/models/graph_event.py` (`GraphEvent`), imported in
-  `apps/api/app/models/__init__.py` (and `__all__`), so `Base.metadata` contains it.
+- New models `apps/api/app/models/graph_event.py` (`GraphEvent`) and
+  `apps/api/app/models/audit_link.py` (`AuditLink`), both imported in
+  `apps/api/app/models/__init__.py` (and `__all__`), so `Base.metadata` contains them.
 - `tests/unit/test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema`
-  must keep passing: the migration must produce exactly the model's columns and indexes.
-  The model's index names must therefore match §7.2 verbatim.
-- The audit model gains the five nullable columns; the migration must add them, or the drift
-  test fails.
+  must keep passing: the migration must produce exactly the models' columns and indexes. The
+  models' index names must therefore match §7.2 verbatim.
+- `apps/api/app/models/audit_event.py` is **not modified**. That is now a testable property,
+  not a promise: T19b asserts its column set is unchanged, so the "no changes to existing
+  tables" constraint cannot be quietly broken later.
 
 ### 7.5 Transaction boundaries
 
-- Each event is written in its own short transaction on a fresh session (`async with
+- Each graph event is written in its own short transaction on a fresh session (`async with
   async_session_factory()` → `add` → `commit`), matching `create_task_event` and
   `_emit_step_event` conventions.
-- No event write joins the pipeline's request transaction: a failed event must never roll
-  back task state.
+- No graph event write joins the pipeline's request transaction: a failed event must never
+  roll back task state.
+- The audit link is written in the **same** transaction as the audit row it describes
+  (§5.1), so the pair is atomic; a failure leaves the audit event queued for retry.
 - The artifact event is emitted **after** the artifact commit (never inside it), so a
   verified event cannot exist without the row it references.
 
@@ -707,7 +776,8 @@ created by `create_all` automatically, so it needs no guard (but the writer must
 |---|---|---|---|
 | Autoincrement PK | `INTEGER PRIMARY KEY AUTOINCREMENT` (never reuses) | `SERIAL` (sequence never reuses) | `sa.Integer, primary_key=True, autoincrement=True` + `sqlite_autoincrement=True` in both model and migration |
 | JSON payload | stored as TEXT, `json` round-trip via SQLAlchemy | `JSON` | `sa.JSON` (already used by `audit_events.details`) |
-| Adding/dropping columns | `batch_alter_table` required for drops | plain ALTER | use batch for both |
+| Schema change kind | `CREATE TABLE` only | `CREATE TABLE` only | no `batch_alter_table`, no `ALTER`, so neither dialect's column-alter limits apply |
+| FK enforcement | **declared only** — no `PRAGMA foreign_keys` in this repo | enforced | the atomic write (§5.1) and the run-start ownership check are the guarantees; tests assert behaviour, not the constraint |
 | Index size | n/a | 63-char identifier cap | names fixed, short |
 | Concurrent writes | database-level write lock | MVCC | writer retries on `OperationalError` "database is locked" (§8.2) |
 
@@ -717,8 +787,9 @@ PG-specific test is marked and skipped with an explicit reason when
 
 ### 7.7 Existing records
 
-`audit_events` keeps every row; the new columns are `NULL` for them. `graph_events` starts
-empty. No `task_events`, `execution_runs`, or artifact rows are modified.
+`audit_events` keeps every row, unchanged in place, with no link row (so its linkage reads
+`null`). `graph_events` and `audit_links` start empty. No `task_events`, `execution_runs`, or
+artifact rows are modified, and no existing table's DDL is touched.
 
 ### 7.8 API: deferred (explicit)
 
@@ -734,7 +805,7 @@ audit endpoints continuing to work. The first read API arrives in Phase 2/4
 
 | Condition | Behaviour | Observable signal | Changes execution? |
 |---|---|---|---|
-| `V3_EVENTS_ENABLED` unset/false | no writes, no lookups | none | no |
+| `V3_EVENTS_ENABLED` unset/false (the default, D5) | no writes, no lookups | none | no |
 | `graph_events` table absent (migration not applied) | writer catches, disables itself for the process | `graph_events_write_failures` + one warning per process | no |
 | `ctx` has no provenance (direct adapter use) | event skipped | `graph_events_skipped_no_provenance` | no |
 | Duplicate `idempotency_key` (`IntegrityError`) | treated as success (already recorded) | `graph_events_duplicates` | no |
@@ -744,6 +815,7 @@ audit endpoints continuing to work. The first read API arrives in Phase 2/4
 | `target_id` normalization fails | event kept with `target_id = NULL` | `graph_events_invalid_target` | no |
 | Provenance mismatch at run start | `ProvenanceError` raised **before steps** | run fails with an explicit error | **yes, deliberately** — an unprovable run must not execute |
 | Audit flush failure | unchanged existing behaviour (events stay queued, retried) | existing | no |
+| Audit link insert fails | the whole flush transaction rolls back, so the audit row is not persisted either; events stay queued and retry | existing flush diagnostics | no |
 | Process crash mid-run | events already committed survive; the un-flushed tail is lost (same honesty note as the audit trail) | none | no |
 
 ### 8.2 Retry policy (concrete)
@@ -754,14 +826,20 @@ never retries `IntegrityError` (deduped) or validation errors. Retries reuse the
 
 ### 8.3 No partial events
 
-One row per insert; there is no multi-row transaction to leave half-done. If a lifecycle
-event fails while its sibling succeeds, the gap is **honest**: readers see
-`attempted` without `executed` and must treat it as `unknown` (Phase 4 rule), which is exactly
-what the design requires.
+A graph event is one row, so there is no multi-row transaction to leave half-done. The one
+place where two rows must agree — an audit row and its `audit_links` row — is committed in a
+single transaction, so a link can never outlive its audit row or vice versa. If a lifecycle
+event fails while its sibling succeeds, the gap is **honest**: readers see `attempted`
+without `executed` and must treat it as `unknown` (Phase 4 rule), which is exactly what the
+design requires.
 
 ### 8.4 Ordering and timestamps
 
 - `seq` provides total order; readers must never order by `occurred_at`.
+- **`seq` orders inserts; it does not assert causality or identity.** Two events' relationship
+  comes from `action_id` (same invocation), `correlation_id` (same kernel decision) and
+  `target_id` (same resource); a lower `seq` never by itself proves that one event caused
+  another. A gap in `seq` is a gap in the write log, not a claim that something was omitted.
 - `occurred_at` is the emitting process's wall clock (single API process in the current
   deployment; multi-replica skew would show as non-monotonic timestamps but never as wrong
   ordering).
@@ -782,7 +860,7 @@ what the design requires.
 Conventions: file-backed SQLite via `DATABASE_URL=sqlite+aiosqlite:///<tmp>` pinned before
 importing `app.main` (as in `test_capability_audit.py`), `asyncio_mode=auto`, real
 `AdapterRegistry`/kernel (no stubs for the gate), and direct SQL assertions on
-`graph_events` / `audit_events`. Each test sets `V3_EVENTS_ENABLED=1` via fixture unless the
+`graph_events` / `audit_links` / `audit_events`. Each test sets `V3_EVENTS_ENABLED=1` via fixture unless the
 test is about the flag. **Every test path below is a new file** except
 `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing,
 marked *existing*).
@@ -812,9 +890,11 @@ marked *existing*).
 | T15b | `test_graph_events.py::test_writer_only_inserts` | model introspection + one emit | inspect `GraphEvent` | no `updated_at` column; the writer module exposes no update/delete helper; the row is unchanged after a re-emit | evidence is append-only by construction |
 | T16 | `test_provenance.py::test_unknown_action_id_is_rejected` | adapter emits with an `action_id` the registry never issued | emit | no row; counter incremented | a compromised adapter cannot invent an invocation |
 | T17 | `test_provenance.py::test_identity_fields_are_not_read_from_params` | `params={"user_id": victim, "task_id": victim_task}` with a real ctx | full run | event `user_id`/`task_id` equal the **ctx/task** values, not the params | client-controlled params can never set identity |
-| T18 | `test_audit_linkage.py::test_audit_row_carries_user_task_run_action` | pipeline run with `fs_write` (denial and success) | flush, read row | `user_id/task_id/run_id/action_id` populated; `actor_id=pipeline-service` | closes audit gap 1 |
-| T19 | `test_audit_linkage.py::test_legacy_audit_rows_remain_readable` | insert a row with NULL linkage directly | `read_from_db` + `/api/v1/audit` | row returned; new keys `None`; existing keys unchanged | no break for pre-V3 evidence |
-| T20 | `test_audit_linkage.py::test_audit_api_shape_is_additive` | system-admin token as in existing tests | GET `/api/v1/audit` | same status/fields; five new nullable keys present | API compatibility |
+| T18 | `test_audit_linkage.py::test_audit_row_carries_user_task_run_action` | pipeline run with `fs_write` (denial and success) | flush, read `audit_events` + `audit_links` | one link row per new audit row; `user_id/task_id/run_id/action_id` populated; `actor_id=pipeline-service` | closes audit gap 1 without touching the audit table |
+| T18b | `test_audit_linkage.py::test_link_and_audit_row_are_atomic` | flush patched so the `audit_links` insert raises | `flush_pending` | nothing persisted (no orphan audit row, no orphan link); events remain pending; a later flush persists both | linkage can never be silently dropped |
+| T19 | `test_audit_linkage.py::test_legacy_audit_rows_remain_readable` | insert an `audit_events` row directly, no link | `read_from_db` + `/api/v1/audit` | row returned; five linkage keys `None`; existing keys identical | no break for pre-V3 evidence |
+| T19b | `test_audit_linkage.py::test_audit_events_schema_is_unchanged` | introspect `AuditEventModel` and the migrated table | compare column sets | identical to the pre-V3 shape (no linkage columns added) | enforces design §13's "no changes to existing tables" as a test, not a promise |
+| T20 | `test_audit_linkage.py::test_audit_api_shape_is_additive` | system-admin token as in existing tests | GET `/api/v1/audit` | same status/fields; five new nullable keys present, sourced from the join | API compatibility |
 | T21 | `test_fs_read_instrumentation.py::test_successful_read_emits_observed_and_audits` | real file inside task scope | `fs_read` via registry | `resource.read.observed` outcome `executed`, `target_id="res:<task>/<rel>"`, `size` correct; audit `allowed=true` | closes audit gap 2 |
 | T22 | `test_fs_read_instrumentation.py::test_denied_read_emits_denied_and_no_content` | path outside scope (`../x`) | `fs_read` | `resource.read.denied`, `reason=outside_workspace`; `target_id` NULL; payload has basename only; **no** absolute path anywhere in the row | refusals are visible without leaking paths |
 | T23 | `test_fs_read_instrumentation.py::test_missing_file_is_failed_not_denied` | non-existent path inside scope | `fs_read` | `resource.read.observed` outcome `failed`, `error_kind=not_found`; result still `success=False` | distinguishes a tool error from a policy denial |
@@ -826,8 +906,8 @@ marked *existing*).
 | T29 | `test_workspace_quota_integration.py::test_write_commit_is_observed_not_verified` | normal write | `fs_write` | `resource.write.committed` `evidence_class=observed` | an adapter claim is never promoted |
 | T30 | `test_artifact_events.py::test_artifact_registered_is_verified_with_hash` | real pipeline step writing a deliverable | run pipeline | `artifact.registered` `evidence_class=verified`; `sha256` equals file hash; references existing artifact row | verified evidence requires corroboration |
 | T31 | `test_artifact_events.py::test_artifact_event_absent_when_registration_fails` | force registration failure | run | no `artifact.registered`; existing `artifact_registration_failed` task event still emitted | no verified claim without the row |
-| T32 | `test_migration_003.py::test_upgrade_downgrade_round_trip_sqlite` | temp SQLite DB, env pinned | `alembic upgrade head` → `downgrade 002` → `upgrade head` | succeeds; `graph_events` present/absent/present; audit columns present/absent/present; pre-existing rows preserved | reversible, non-destructive migration |
-| T33 | `test_migration_003.py::test_existing_audit_rows_survive_upgrade` | DB at `002` with audit rows | upgrade to head | row count and values unchanged; new columns NULL | legacy evidence is preserved |
+| T32 | `test_migration_003.py::test_upgrade_downgrade_round_trip_sqlite` | temp SQLite DB, env pinned | `alembic upgrade head` → `downgrade 002` → `upgrade head` | succeeds; `graph_events` + `audit_links` present/absent/present; `audit_events` DDL unchanged throughout | reversible, non-destructive migration |
+| T33 | `test_migration_003.py::test_existing_audit_rows_survive_upgrade` | DB at `002` with audit rows | upgrade to head | row count and every value unchanged; no link rows created; no `alter` ran on `audit_events` | legacy evidence is preserved verbatim |
 | T34 | `test_migration_003.py::test_postgres_migration_and_events` (marked, skipped without PG) | `RAIVISOX_TEST_POSTGRES_URL` set | upgrade + emit | same schema/behaviour on PG | PG is otherwise unverified — see §7.6 |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | unchanged | run | still passes (zero drift) | model and migration cannot diverge |
 | T36 | Existing suites (`tests/unit/*`, live container gate) | unchanged | run | all previously passing tests still pass; counts unchanged | no regression to authorization, sandbox, quotas, digest pinning |
@@ -838,7 +918,7 @@ Additional non-functional assertions:
   (sanity bound for the hot path, not a performance claim).
 - `test_audit_linkage.py::test_kernel_call_sites_still_work_without_new_kwargs`: a legacy
   `authorize_and_log(actor_id, action, resource, permissions)` call (no new kwargs) still
-  works and writes NULL linkage.
+  works and writes no `audit_links` row.
 
 ### 9.1 Explicitly not tested / not claimed
 
@@ -848,9 +928,9 @@ Additional non-functional assertions:
 
 ### 9.2 No weakening
 
-No existing test is modified except the two that assert exact schema shape if any (none
-currently assert `audit_events` column sets); the drift test is expected to pass unchanged.
-If a test fails, the implementation is wrong, not the test.
+No existing test is modified. No current test asserts an `audit_events` column set, so the new
+test T19b *adds* that guarantee rather than retrofitting it; the drift test is expected to
+pass unchanged. If a test fails, the implementation is wrong, not the test.
 
 ---
 
@@ -863,10 +943,10 @@ Phase 2 concerns.
 |---|---|---|---|
 | S1 | Event schema constants: event types, outcome/enums, allowlist table, source table, key recipes, target normalizers (pure, no DB) | `services/graph/schema.py` (new) | unit tests for enums/normalizers/key recipes pass with no DB |
 | S2 | Writer: `emit()`, retries, counters, validation, payload hash, enable flag read from `V3_EVENTS_ENABLED` via `os.environ` in the graph module (mirrors `WorkspaceQuota.from_env`; no `app.config` import, so `services/graph` stays framework-free — `Settings` is **not** extended) | `services/graph/events.py` (new) | T4–T12 green |
-| S3 | Model + migration + `models/__init__` + `init_db` guard | `apps/api/app/models/graph_event.py`, `alembic/versions/003_*.py`, `app/models/__init__.py`, `app/database.py` | T32, T33, T35 green |
-| S4 | Audit linkage plumbing (dataclass, `log`, flush, read, `ActionContext` fields, kernel kwargs, `SecurityDecision.request_id`) | `services/security/audit_trail.py`, `security_kernel.py`, `apps/api/app/models/audit_event.py` | T18–T20 green; legacy call-site test green |
+| S3 | Models + migration + `models/__init__` (two new tables, **no `init_db` guard**, no edit to `audit_event.py`) | `apps/api/app/models/graph_event.py`, `apps/api/app/models/audit_link.py`, `alembic/versions/003_*.py`, `app/models/__init__.py` | T19b, T32, T33, T35 green |
+| S4 | Audit linkage plumbing (dataclass, `log`, flush with atomic link insert, join read, `ActionContext` fields, kernel kwargs, `SecurityDecision.request_id`) | `services/security/audit_trail.py`, `security_kernel.py` | T18–T20 green; legacy call-site test green |
 | S5 | Provenance handle + `AdapterContext` fields + pipeline wiring | `services/graph/provenance.py` (new), `integrations/adapters/base.py`, `apps/api/app/main.py` (`_build_worker`, one call site, `run_task_pipeline`) | T13–T17 green |
-| S6 | Registry lifecycle emission (+ `ctx.extra["v3_action_id"]`, live-action registry) | `integrations/adapters/registry.py` | T1–T3, T16 green |
+| S6 | Registry lifecycle emission (+ `ctx.action_id`, live-action registry) | `integrations/adapters/registry.py` | T1–T3, T16 green |
 | S7 | `fs_read` / `fs_write` instrumentation | `integrations/adapters/builtin.py` | T21–T24, T28, T29 green |
 | S8 | `http_get` instrumentation | `integrations/adapters/http_get.py` | T25–T27 green |
 | S9 | Artifact event | `apps/api/app/main.py::_register_task_artifact` | T30, T31 green |
@@ -885,39 +965,177 @@ the registry so no event is ever written with an unverified `user_id`.
 | ID | Risk | Impact | Mitigation |
 |---|---|---|---|
 | R1 | Extra DB writes on the tool hot path (up to 5 rows per invocation) | latency, SQLite write contention | one short insert per event; retry-on-locked; T11 concurrency test; measure in S10 |
-| R2 | `audit_events` grows five columns + one index | storage, write cost | nullable, fixed-width; no backfill |
+| R2 | `audit_links` adds one row per attributed audit event + four indexes | storage, write cost | row written only when linkage exists; batched with the audit insert; no backfill |
 | R3 | Path/user-data leakage through `target_id`/payload | privacy | normalizer rejects; allowlist drops unknown keys; sentinel tests T22/T24/T27 |
-| R4 | Events silently absent because the flag is off | false sense of coverage | counters + `/health` visibility in Phase 2; documented default; CI enables it for the new tests |
+| R4 | Events silently absent because the flag is off | false sense of coverage | counters + startup log now; `/health` visibility in Phase 2; CI enables it for the new tests; production enablement gated (G1) |
 | R5 | Kernel signature creep | callers passing wrong kwargs | all new params default `None`; legacy-call test |
 | R6 | SQLite "database is locked" under parallel steps | lost events | retry policy §8.2; T11 |
-| R7 | Unbounded growth (no retention in Phase 1) | disk | documented; retention is a Phase 2 decision |
-| R8 | `Integer` `seq` ceiling (~2.1B) | future migration | documented; D6 |
+| R7 | Unbounded growth (no retention in Phase 1) | disk, and sensitive metadata at rest without expiry | flag off by default (D5); G1 gate before production enablement; retention in P2 (D9, G2) |
+| R8 | `Integer` `seq` ceiling (~2.1B) | future table rebuild | ≈ 49 years at design §10 volume; monitor `max(seq)`; D6 |
 | R9 | A compromised adapter lies in its `observed` events | misleading graph | `evidence_class` stays `observed`; only artifact registration is `verified`; Phase 4 forbids promotion |
 | R10 | Provenance resolution adds one query per run | negligible | once per run, not per event |
 | R11 | PostgreSQL path is unverified in CI (SQLite-only) | a PG-only DDL defect could reach production | T34 gated on `RAIVISOX_TEST_POSTGRES_URL`; marked NOT VERIFIED until a PG run is recorded |
+| R12 | SQLite runs without `PRAGMA foreign_keys`, so FKs are declarative there | a reader might over-trust the constraint | the guarantees are the writer's single transaction (T18b) and the run-start ownership check (T13–T17); PG enforces the FKs |
 
-### 11.2 Owner decisions required
+### 11.2 Decision summary (all 12 classified)
 
-| ID | Decision | Recommendation | If declined |
-|---|---|---|---|
-| D1 | Add `user_id`, `execution_run_id` to `AdapterContext` | approve (defaulted, 24 call sites unaffected) | identity plumbed via `ctx.extra` (weaker typing, same security) |
-| D2 | Add five nullable columns to `audit_events` | approve (additive, keeps single-table reads) | separate `audit_links` table + join |
-| D3 | Add `resource.write.denied` to the closed event set | approve (quota refusals are not kernel denials) | `tool.failed` + `denial_kind` payload (string-derived, weaker) |
-| D4 | Defer `capability.granted` to Phase 2 | approve (no user/task subject; would weaken the `user_id NOT NULL` invariant) | nullable `user_id` for global subjects |
-| D5 | `V3_EVENTS_ENABLED` default **off**, enabled explicitly in tests/CI; read from the environment inside `services/graph` (not added to `Settings`) | approve (zero behavioural risk on rollout; keeps `services/` free of API-layer imports) | add to `Settings` as `v3_events_enabled` (also fine; couples the service layer to `app.config`) |
-| D6 | `seq` as `Integer` PK | approve (SQLite autoincrement compatibility) | dialect-specific `BigInteger` + sequence |
-| D7 | Include `artifact.registered` in Phase 1 | approve (the verified edge needs it) | move to Phase 2; Phase 1 has observed writes only |
-| D8 | Unattributable (no-provenance) events are skipped, not stored | approve (keeps `user_id NOT NULL`) | sentinel user id (pollutes isolation) |
-| D9 | No retention/cleanup in Phase 1 | approve (defer to Phase 2 with a policy) | add a pruning job now |
-| D10 | Pass `action_id` to adapters via `ctx.extra` | approve (no signature change) | extend `AdapterContext` with `action_id` (also fine, marginally clearer) |
-| D11 | Add a success audit entry for `fs_write` (symmetry with reads) | approve (denial-only audit is asymmetric) | keep write success in `graph_events` only |
-| D12 | Expose the kernel's `request_id` on `SecurityDecision` | approve (additive, defaulted; makes `correlation_id` grounded) | leave `correlation_id` null in Phase 1 and correlate by `action_id` only |
+| ID | Question | Classification | Final choice | Tests |
+|---|---|---|---|---|
+| D1 | Does `AdapterContext` carry user/run identity? | `RESOLVED — SECURE DEFAULT` | typed, defaulted `user_id` + `execution_run_id` fields (plus `action_id`, D10) | T1, T15, T17 |
+| D2 | Columns on `audit_events`, or a side table? | `RESOLVED — EXISTING CONTRACT` | new `audit_links` table; `audit_events` untouched | T18, T18b, T19, T19b, T20, T32, T33 |
+| D3 | Is a quota/clamp write refusal a new event type? | `RESOLVED — SECURE DEFAULT` | add `resource.write.denied` (reviewed addition to design §5.2) | T28 |
+| D4 | Include `capability.granted` in Phase 1? | `RESOLVED — EXISTING CONTRACT` | no — Phase 2, where declared capability nodes land | — (P2 test, deferred) |
+| D5 | Flag name, default, and where it is read? | `RESOLVED — EXISTING CONTRACT` | `V3_EVENTS_ENABLED`, default **off**, read via `os.environ` inside `services/graph` | T10, T1–T3 |
+| D6 | What type is `seq`? | `RESOLVED — EXISTING CONTRACT` | `Integer` + `sqlite_autoincrement` (no dialect variant) | T8b, T32 |
+| D7 | Is `artifact.registered` in Phase 1? | `RESOLVED — EXISTING CONTRACT` | yes — it is the only `verified` event | T30, T31 |
+| D8 | What happens to events with no provenance? | `RESOLVED — EXISTING CONTRACT` | skipped and counted; never stored unattributed | T15, T17 |
+| D9 | Retention in Phase 1? | `RESOLVED — EXISTING CONTRACT` | none — Phase 2 (design §15.2 item 6); production enablement gated | — (P2 test, deferred) |
+| D10 | How does an adapter learn its `action_id`? | `RESOLVED — SECURE DEFAULT` | typed `AdapterContext.action_id`, set by the registry | T1, T16 |
+| D11 | Audit successful `fs_write`? | `RESOLVED — SECURE DEFAULT` | yes — state changes must be visible in the audit trail | T18 |
+| D12 | Expose the kernel `request_id`? | `RESOLVED — EXISTING CONTRACT` | additive `SecurityDecision.request_id` | T1, T18 |
 
-### 11.3 Deferred to later phases (not gaps in Phase 1)
+### 11.3 Decision record (reason, consequences, compatibility)
 
-Projection/nodes/edges (P2), declared capability nodes (P2), retention (P2), read API (P2/P4),
-analysis (P4), policy/approvals (P5), UI (P6), OS-level child-process instrumentation (post-V3),
-LLM provider events (post-V3).
+**D1 — `AdapterContext` as the identity carrier.** Options: (a) typed defaulted fields;
+(b) `ctx.extra` keys; (c) extra parameters on `run(params, ctx, …)`.
+(b) is untyped and currently unused in production, so a look-alike key is trivially
+pre-populated and nothing documents it; (c) churns 23 construction sites plus every adapter
+for no security gain. **`RESOLVED — SECURE DEFAULT` → (a).** Reason: design §4.4/§9 require
+user/task/run to come from trusted context, never a request body; a typed field is set at one
+pipeline site, has a visible default, and cannot be confused with adapter scratch data.
+Consequences: 23 existing call sites unaffected; a directly-constructed context without
+provenance produces no events (D8). Compatibility: purely additive defaults; no signature
+change; no migration.
+
+**D2 — audit linkage shape.** Options: (a) five nullable columns on `audit_events`;
+(b) `audit_links` side table; (c) defer to Phase 2. (a) edits a forensic table and violates
+design §13's "no changes to existing tables"; (c) leaves gap 1 open and contradicts design
+§15.1, which classifies it as Phase 1 work. **`RESOLVED — EXISTING CONTRACT` → (b).** This
+**supersedes the earlier column recommendation** in §5.1 of this document, which is
+withdrawn. Reason: the design is authoritative on migration scope, and the audit row is
+evidence whose shape existing tooling already depends on; linkage is optional metadata about
+that row, not part of the audit fact. Consequences: flush writes two rows in one transaction
+(atomic pair), `read_from_db` left-joins, legacy rows have no link and read `null`, the
+`init_db` ALTER guard disappears from the plan, and `audit_event.py` is not edited. The design's
+Phase 1 file list gains one new file, `apps/api/app/models/audit_link.py` (added, not changed).
+Compatibility: `audit_events` byte-identical (asserted by T19b); `/api/v1/audit` gains five
+nullable keys on a plain-dict response; revision `003` is `CREATE TABLE` only.
+
+**D3 — write refusals get their own type.** Options: (a) add `resource.write.denied`;
+(b) reuse `tool.failed` + `denial_kind`. (b) conflates "the adapter ran and failed" with "a
+gate refused before any byte was written", forcing readers to parse a string to tell them
+apart — exactly what design §5.4 forbids. **`RESOLVED — SECURE DEFAULT` → (a).** Reason: design
+§5.2 permits additions as a reviewed schema change, and the closed set already has
+`resource.read.denied`; a kernel *decision* is still never written as a resource denial
+(§3.8). Consequences: 13 event types in Phase 1; the design's §5.2 list must record the
+addition in the same implementation commit; the Phase 2 projection maps it to a denial, not
+to a failed execution. Compatibility: no schema change beyond the enum's closed set; no
+migration.
+
+**D4 — `capability.granted` waits for Phase 2.** Options: (a) defer; (b) emit in Phase 1 with
+a nullable `user_id`; (c) emit against a synthetic service user. (b) and (c) either weaken the
+`user_id NOT NULL` isolation key (design §4.4/§9) or invent an identity, which the design
+explicitly refuses to do. **`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design §13 Phase 1
+acceptance is scoped to kernel decisions and adapter invocations; capability grants are
+global to service actors, carry no user or task subject, and design §4.3 already marks
+`holds-capability` as config-derived rather than run-scoped. Consequences: Phase 1 emits no
+capability rows; Phase 2 owns declared capability nodes and their startup snapshot. No
+decision in either document is blocked by the absence.
+
+**D5 — flag name, default, and location.** Options: (a) `V3_EVENTS_ENABLED`, default off, read
+via `os.environ` in `services/graph`; (b) default on; (c) a `Settings` field.
+(b) starts writing user-attributable evidence on deploy with no consumer, no retention (D9),
+and no read API — a privacy surface with no reader; (c) couples the service layer to
+`app.config` for no functional gain. **`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design
+§13 Phase 1 names the flag and says "default off"; service-level flags already read
+`os.environ` (`SANDBOX_*`, `RAIVISOX_HTTP_ALLOWED_HOSTS`, `WorkspaceQuota.from_env`), so this
+matches the codebase. Consequences: tests and CI set the variable explicitly to exercise the
+enabled paths, so default-off costs no coverage; R4 (silent absence) is handled by counters
+and a startup log, not by collecting by default. Compatibility: unset flag = byte-for-byte
+today's behaviour.
+
+**D6 — `seq` stays `Integer`.** Options: (a) `Integer` + `sqlite_autoincrement`;
+(b) `BigInteger` with a SQLite variant; (c) plain `BigInteger`. (c) silently breaks SQLite
+autoincrement while the column-name drift test still passes; (b) works but introduces the
+repo's first dialect-specific type variant to solve a capacity problem the design's own
+volume estimate does not reach. **`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design §4.4
+specifies a "DB-assigned monotonic integer"; every integer column in `apps/api/app/models` is
+`Integer`; and the ordering guarantee rests on non-reuse (`sqlite_autoincrement`, PG sequence),
+not on width. At design §10's upper estimate of 120k events/day the 2³¹ ceiling is ≈ 49 years.
+Consequences: R8 stays open with an explicit trigger (monitor `max(seq)` against 2³¹); a
+future widening is a table rebuild, and the events themselves remain the portable record.
+
+**D7 — `artifact.registered` is Phase 1.** Options: (a) include; (b) defer. (b) would leave
+Phase 1 with only `observed` evidence and give the design's `writes` edge — specified as
+`verified` — no source at all. **`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design §4.3
+says the writes edge is verified and "P1 adds the event"; design §5.1 lists
+`_register_task_artifact` as an emission point. Consequences: the `user_id` is resolved inside
+that function from the task row and the event is emitted only after the artifact commit, so a
+`verified` event cannot exist without the row it corroborates (T31). Compatibility: no schema
+change; one hook in an existing function.
+
+**D8 — unattributable events are skipped.** Options: (a) skip and count; (b) sentinel user id;
+(c) nullable `user_id`. (b) assigns actions to someone who did not perform them; (c) removes
+the column's isolation meaning. **`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design §4.4
+makes `user_id` `NOT NULL` and design §11.1 requires missing evidence to read as `unknown`,
+never as invented. Consequences: direct adapter use outside a run produces no graph rows; the
+counter `graph_events_skipped_no_provenance` keeps that gap visible instead of silent.
+Compatibility: none — no event exists for those calls, exactly as today.
+
+**D9 — no retention in Phase 1.** Options: (a) none; (b) a 90-day pruning job now. (b) adds a
+deletion path over security evidence before the projection or read API exists, and the design
+assigns retention to Phase 2 precisely so it can be reconciled with
+`ARTIFACT_RETENTION_DAYS` (default `0` = keep forever) rather than diverging from it.
+**`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design §15.2 item 6 names P2; design §13
+Phase 1 migration and DoD do not include retention. Consequences: if an operator enables the
+flag, growth is unbounded until P2 — which is why production enablement is gated (G1). The
+retention *value* remains an owner decision for P2 (G2).
+
+**D10 — `action_id` is a typed field.** Options: (a) `AdapterContext.action_id`;
+(b) `ctx.extra["v3_action_id"]`. (b) puts provenance in an untyped dict that any caller can
+pre-populate and that has no production consumer today; it is indistinguishable from scratch
+data. **`RESOLVED — SECURE DEFAULT` → (a).** Reason: provenance must travel on the trusted
+context, and a typed field is the version that can be reviewed, defaulted and grepped.
+Consequences: the registry assigns it immediately before `adapter.run`; the live-set
+membership check (T16) still decides whether an adapter-originated id is accepted, so typing
+is defence in depth, not the control. Compatibility: one more additive default; no signature
+change.
+
+**D11 — successful writes are audited.** Options: (a) add the success audit entry;
+(b) graph event only. (b) leaves an audit trail that records refused writes but not completed
+ones — an evidence hole for the operations that actually change state.
+**`RESOLVED — SECURE DEFAULT` → (a).** Reason: reads were the named gap, but writes are the
+higher-consequence class; symmetry is the minimum honest coverage, and the entry carries no
+content. Consequences: one extra audit row (and its `audit_links` row) per successful write;
+the existing batched flusher absorbs it; the graph event remains the analytical record.
+
+**D12 — the kernel exposes its `request_id`.** Options: (a) add
+`SecurityDecision.request_id`; (b) leave `correlation_id` null. (b) abandons the design's
+stated correlation between an event and the exact audit row that justified it, leaving readers
+to guess from timestamps — which design §5.3 forbids as an ordering mechanism.
+**`RESOLVED — EXISTING CONTRACT` → (a).** Reason: design §4.4 defines `correlation_id` as the
+kernel `request_id` and §5.1 requires it on the decision events; the id is already generated
+and written to the audit row, then discarded. Consequences: one additive defaulted field; no
+behavioural change; `correlation_id` is null exactly where no decision was made, which is
+itself meaningful (§3.8). Compatibility: no schema or API change.
+
+### 11.4 Owner gates (none blocks Phase 1 implementation)
+
+| ID | Gate | Status | Recommendation | Why it is not blocking |
+|---|---|---|---|---|
+| G1 | Enabling `V3_EVENTS_ENABLED` in a real deployment | **OWNER INPUT REQUIRED** | keep it off outside dev/test/CI until Phase 2 ships retention and a read path | Phase 1 implementation is testable with the flag enabled in tests; the default stays off |
+| G2 | Retention value and its reconciliation with `ARTIFACT_RETENTION_DAYS` | **OWNER INPUT REQUIRED** (Phase 2) | 90 days (design §9), aligned so evidence and artifacts expire together | Phase 1 implements no retention (D9) |
+| G3 | Whether real users may hold `ADMIN` (audit and global graph views) | **OWNER INPUT REQUIRED** (Phase 5/6) | decide with the operator model; V3 must not grant it silently | Phase 1 adds no admin surface and no new route |
+
+These are product/deployment decisions, not technical unknowns: each has a stated safe default
+that this document already implements, and none of them changes what Phase 1 code must do.
+They are listed so that no reader mistakes an architect resolution for human sign-off.
+
+### 11.5 Deferred to later phases (not gaps in Phase 1)
+
+Projection/nodes/edges (P2), declared capability nodes and `capability.granted` (P2), retention
+(P2), read API (P2/P4), analysis (P4), policy/approvals (P5), UI (P6), OS-level child-process
+instrumentation (post-V3), LLM provider events (post-V3).
 
 ---
 
@@ -926,26 +1144,28 @@ LLM provider events (post-V3).
 Phase 1 is done only when **all** of the following are demonstrated with evidence, not
 assertion:
 
-1. **Schema**: `graph_events` exists with the §3.1 columns/constraints/indexes; the five
-   audit columns exist and are nullable; `alembic upgrade head` on a fresh SQLite DB
-   reproduces `Base.metadata` exactly (the existing zero-drift test passes).
+1. **Schema**: `graph_events` exists with the §3.1 columns/constraints/indexes and
+   `audit_links` with the §5.1 shape; `audit_events` still has exactly its pre-V3 columns
+   (T19b); `alembic upgrade head` on a fresh SQLite DB reproduces `Base.metadata` exactly
+   (the existing zero-drift test passes).
 2. **Migration safety**: `upgrade → downgrade 002 → upgrade` round-trips; a pre-existing
-   `audit_events` row survives with `NULL` linkage (T32, T33).
+   `audit_events` row survives byte-identically with no link row; no `ALTER` runs on any
+   existing table (T32, T33).
 3. **Emission**: when `V3_EVENTS_ENABLED=1`, a pipeline run produces `tool.attempted` plus a
    terminal event per invocation, `resource.read.*` for each `fs_read`, `resource.write.*`
    for each `fs_write`, `endpoint.connect.*` for `http_get`, and one
    `artifact.registered` per registered artifact — asserted by querying the run's rows and
    counting against the adapters actually invoked (T1, T21, T25, T30).
-4. **Gap 1 closed**: every new audit row written by a pipeline tool gate carries
-   `user_id`, `task_id`, `run_id`, `action_id`; legacy rows are unchanged and readable
-   (T18, T19).
+4. **Gap 1 closed**: every new audit row written by a pipeline tool gate has an
+   `audit_links` row carrying `user_id`, `task_id`, `run_id`, `action_id`; the audit table's
+   own shape is unchanged and legacy rows read as `null` linkage (T18, T18b, T19, T19b).
 5. **Gap 2 closed**: a successful `fs_read` produces both an audit entry and a
    `resource.read.observed` event; a denied read produces `resource.read.denied`
    (T21, T22).
 6. **Identity cannot be spoofed**: forged `user_id`, foreign `run_id`, unknown `action_id`,
    and identity-in-params are all refused with no row written (T13–T17).
 7. **No secrets/content**: no file content, env value, query string, header, or absolute
-   path appears in `graph_events` or the new audit columns (T4, T5, T22, T24, T27).
+   path appears in `graph_events`, `audit_links`, or audit details (T4, T5, T22, T24, T27).
 8. **Duplicates and ordering**: re-emitting is a no-op; ordering is `seq`-based; gaps are
    preserved (T7, T8).
 9. **Restart**: a restart preserves rows (T9).
@@ -971,7 +1191,8 @@ assertion:
 | Closed event set | design §5.2 | — (new) |
 | Provenance fields | design §4.4 | `audit_event.py`, `execution_run.py`, `task.py` |
 | Emission points | design §5.1 | `registry.py`, `builtin.py`, `http_get.py`, `main.py` |
-| Audit linkage gap | design §1.3, design §15.1 | `audit_trail.py`, `security_kernel.py` |
+| Audit linkage gap | design §1.3, design §15.1 | `audit_trail.py` (`flush_pending`, `read_from_db`), `security_kernel.py`; new `models/audit_link.py` |
+| Migration scope | design §13 Phase 1 ("no changes to existing tables") | revision `003` = two `CREATE TABLE`s; no `ALTER`; no `init_db` guard |
 | `fs_read` gap | design §5.6 | `builtin.py` (denial-only audit) |
 | Verified writes | design §4.3 (`verified`) | `task_artifact.py`, `_register_task_artifact` |
 | Authority invariant | design §7.2 | kernel/sandbox path unchanged |
