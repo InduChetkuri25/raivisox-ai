@@ -460,6 +460,12 @@ Local (Windows) runs remain a development signal only: the POSIX-only
 quota and `/proc` tests skip there with an explicit reason and are never
 reported as passes.
 
+The consolidated acceptance evidence — CI run and commit references, the
+local regression counts, the T1–T13 checklist with its two documented
+PARTIALs (image toolchain minimality, no total-disk quota on the
+workspace mount) and the final verdict — lives in
+[`v2-acceptance-report.md`](v2-acceptance-report.md).
+
 - Unresolved question 3 (fail closed vs. fail documented) is answered as:
   an **invalid** `SANDBOX_BACKEND` value raises loudly at construction; a
   **valid but unavailable** backend fails each execution honestly (§5 row
