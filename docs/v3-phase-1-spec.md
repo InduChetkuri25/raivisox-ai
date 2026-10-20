@@ -1009,8 +1009,8 @@ change; no migration.
 
 **D2 — audit linkage shape.** Options: (a) five nullable columns on `audit_events`;
 (b) `audit_links` side table; (c) defer to Phase 2. (a) edits a forensic table and violates
-design §13's "no changes to existing tables"; (c) leaves gap 1 open and contradicts design
-§15.1, which classifies it as Phase 1 work. **`RESOLVED — EXISTING CONTRACT` → (b).** This
+design §13's "no changes to existing tables"; (c) leaves gap 1 open and contradicts
+design §15.1, which classifies it as Phase 1 work. **`RESOLVED — EXISTING CONTRACT` → (b).** This
 **supersedes the earlier column recommendation** in §5.1 of this document, which is
 withdrawn. Reason: the design is authoritative on migration scope, and the audit row is
 evidence whose shape existing tooling already depends on; linkage is optional metadata about
