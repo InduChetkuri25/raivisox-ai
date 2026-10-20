@@ -979,6 +979,14 @@ the registry so no event is ever written with an unverified `user_id`.
 
 ### 11.2 Decision summary (all 12 classified)
 
+Classification meanings, used verbatim throughout: **`RESOLVED — SECURE DEFAULT`** — the
+requirements and the invariants above imply one choice, and it is the more restrictive or
+better-evidenced one; **`RESOLVED — EXISTING CONTRACT`** — the V3 design or existing code
+already fixes the answer, so deviating would be the change; **`OWNER INPUT REQUIRED`** —
+depends on product or deployment intent that neither document can settle, so it is recorded as
+a gate (§11.4), never silently decided. None of the twelve falls in the third class; the gates
+that do are listed separately and none blocks implementation.
+
 | ID | Question | Classification | Final choice | Tests |
 |---|---|---|---|---|
 | D1 | Does `AdapterContext` carry user/run identity? | `RESOLVED — SECURE DEFAULT` | typed, defaulted `user_id` + `execution_run_id` fields (plus `action_id`, D10) | T1, T15, T17 |
