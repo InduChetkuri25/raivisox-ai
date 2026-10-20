@@ -222,7 +222,9 @@ only inserts (§9 T15b).
 
 `capability.granted` is **deliberately deferred to Phase 2** — **[OWNER APPROVAL REQUIRED — D4]**: kernel grants are global to service actors, have no user or task subject, and
 forcing them into a table whose `user_id` is `NOT NULL` would either weaken the isolation
-invariant or require synthetic users. Phase 2 introduces declared capability nodes, where a global,
+invariant or require synthetic users. Note the deliberate asymmetry with the per-event
+"attempted / allowed / denied / executed / failed" split explained in §3.8: that is the
+distinction between *decision* and *outcome*, not a decision field. Phase 2 introduces declared capability nodes, where a global,
 non-user subject is the correct shape.
 
 `resource.write.denied` does not exist in the design's closed set. It is proposed because a
@@ -291,6 +293,30 @@ and counted (`graph_events_invalid`), never silently rewritten.
 `schema_version` starts at `1`. The writer always writes `1`. Readers (Phase 2) must refuse
 rows with a version they do not know and report the count; a Phase 1 test asserts that an
 inserted version-`2` row is not silently interpreted (the reader helper rejects it).
+
+### 3.8 Requested action, authorization decision, observed outcome (kept distinct)
+
+Phase 1 represents the request/decision/outcome triple **as separate rows, not as fields on
+one row**, because collapsing them is how a denial gets misread as an execution. The mapping
+to the kernel's own vocabulary is exact:
+
+| Concept | Kernel / pipeline vocabulary | Phase 1 representation |
+|---|---|---|
+| Requested action | `action=f"tool:{adapter.id}"` passed to `authorize_and_log` | derivable as `tool:<tool_id>`; the *target* of the request is `target_id`, the invocation is `action_id` |
+| Requested permissions | `adapter.kernel_permissions` | `tool.attempted.payload.resource_ref` (no permission list — it is a static adapter property, so storing it per event would be noise) |
+| Authorization decision | `SecurityDecision.allowed` / `denied_permissions` / `reason` | **its own row**: `tool.allowed` (payload `granted_permissions`) or `tool.denied` (payload `denied_permissions`, `reason`); `correlation_id` = the audit `request_id` |
+| Observed outcome | `AdapterResult.success` / `error` | a **separate** row with the same `action_id`: `tool.executed` or `tool.failed` (`error_kind`; `denial_kind` only for adapter-level refusals) |
+| No decision at all | `kernel_permissions == []` | no `allowed`/`denied` row exists; the absence is meaningful (§9 T1b) |
+
+Consequences the tests enforce: a denied invocation has a `tool.denied` row and **no**
+terminal row for that `action_id` (§9 T2); a `tool.allowed` row without its preceding
+`tool.attempted` is a defect (§3.4); and an adapter-level refusal (`resource.*.denied`,
+`tool.failed` with `denial_kind`) is never written as `tool.denied`, because the kernel
+allowed it. There is deliberately **no** `decision` column and **no** `success` column: a
+single boolean column would invite exactly the conflation the design forbids.
+
+Two clocks only, both stated: `occurred_at` is the emitting process's wall clock at the
+event site; `recorded_at` is the insert clock. Neither is ever used for ordering (§8.4).
 
 ---
 
