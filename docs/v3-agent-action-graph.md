@@ -815,7 +815,9 @@ strictly no weaker. "DoD" is the bar for merging.
   `attempted` + one terminal event; the V2 suite stays green.
 - **DoD:** events observable in a dev DB; flag off by default.
 
-**Status (2026-10-20): IMPLEMENTED — Phase 1 only.** Specification:
+**Status (2026-10-21): IMPLEMENTED — Phase 1 only.** Implementation commit
+`f30e6a4`; CI run `39554959798` green (backend 638 passed / 33 skipped, live Docker
+container gate 19 passed / 0 skipped, frontend build). Specification:
 `docs/v3-phase-1-spec.md`; results: `docs/v3-phase-1-acceptance.md`. What exists now:
 `services/graph/{schema,actions,provenance,events}.py`, `app/models/{graph_event,audit_link}.py`,
 `alembic/versions/003_graph_events_audit_links.py`, registry/adapter instrumentation, the
@@ -951,7 +953,7 @@ approval flow, graph UI. PostgreSQL is designed for, not verified (no PG instanc
 | Hardlink redirection and writes by running children can exceed the quota | **PARTIAL** — documented, inodes counted once, no interception | sandbox-design §5.1; `test_hardlinked_inode_is_counted_once` |
 | Container image toolchain not minimal (`python:3.12-slim` ships `pip`) | **PARTIAL** — digest pinned, toolchain still general | `services/execution/image_pins.py`; `APPROVED_IMAGES`; live gate |
 | Digest verification needs registry access; must fail closed offline | **PASS** for the documented behaviour — refusal, pull failure, and mismatch all fail closed; the explicit override is reported as `image_pinned: false` | `tests/unit/test_image_pins.py` (policy refusal, pull/inspect/mismatch, override flag) |
-| V3 Phase 1 (event schema + emission + audit linkage) | **VERIFIED locally** — 44 acceptance tests, SQLite migrations, flag-off inertness; **PostgreSQL unverified** | `docs/v3-phase-1-spec.md` §9; `docs/v3-phase-1-acceptance.md` |
+| V3 Phase 1 (event schema + emission + audit linkage) | **VERIFIED** — 44 acceptance tests locally, Linux CI green (backend suite + live container gate), SQLite migrations; **PostgreSQL unverified** | `docs/v3-phase-1-acceptance.md` §5–§7, §11 |
 | V3 Phases 2–6 (projection, graph store, blast radius, policy, approval, UI) | **NOT IMPLEMENTED** — design only; no code, no tests | this document §13 |
 
 No concrete security **regression** was found while inspecting for this design. Two
