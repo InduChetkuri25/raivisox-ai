@@ -258,17 +258,17 @@ Linux CI (`ubuntu-latest`) for the same commit, from the run's logs:
 
 | Job / step | Result |
 |---|---|
-| `backend-tests` — full suite (`python -m pytest -q`) | **638 passed, 41 skipped, 0 failed** (679 collected, 139 s) |
+| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 47 skipped, 0 failed** (719 collected, 121 s) |
 | `backend-tests` — explicit `-m "not live_llm"` selection | 638 passed, 37 skipped, 4 deselected |
-| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **11 passed, 0 skipped** (the job fails on any skip) |
+| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **17 passed, 0 skipped** (the job fails on any skip) |
 | `container-gate` — docker runtime proof | Docker `server=28.0.4 client=28.0.4`; digest-pinned image ran |
 | `container-gate` — live container tests (`-m live`) | **19 passed, 0 skipped** (a skip fails the gate) |
 | `container-gate` — non-live half | 64 passed, 3 skipped, 19 deselected |
 | `frontend-validation` — `tsc --noEmit` + `npm run build` | passed, build compiled successfully |
 
-The Linux job collects 4 more items than the Windows host (679 vs 675) and skips
-fewer, because several sandbox/container tests are POSIX-only; no test that
-passes locally fails there. The SQLite backend job skips the nine
+The Linux job collects 4 more items than the Windows host (719 vs 715) and skips
+fewer (47 vs 62), because several sandbox/container tests are POSIX-only; no
+test that passes locally fails there. The SQLite backend job skips the fifteen
 PostgreSQL-gated tests by design; the separate `postgres-gate` job runs them.
 
 ## 7. Container gate and PostgreSQL
@@ -295,7 +295,6 @@ PostgreSQL-gated tests by design; the separate `postgres-gate` job runs them.
   | Phase 1 focused suite with the PG URL (§5) | **93 passed, 0 skipped** |
   | Full backend suite without the PG URL (§6) | **619 passed, 56 skipped, 0 failed** |
   | CI `postgres-gate`, run `39579100724` (`postgres:16-alpine`, Linux) | **11 passed, 0 skipped** (17 s) |
-
   What the PostgreSQL run proves, in the server's own terms: migration `003`
   creates both tables with their unique keys, all nine indexes, both
   `ON DELETE CASCADE` rules and a `nextval(...)` default for `seq`;
@@ -386,6 +385,14 @@ Nothing here is a human approval of those gates.
 
 ## 11. CI and delivery
 
+GitHub Actions run **39590736377** for commit `9d1672b` (the retry hardening) —
+**success**, all four jobs green: `Backend tests (pytest)` 672 passed / 47
+skipped / 0 failed; `PostgreSQL gate (real server)` **17 passed, 0 skipped**
+against a `postgres:16-alpine` service (the job fails on any skip), which also
+proves the SQLSTATE classification against the CI-pinned SQLAlchemy; `Container
+sandbox gate (live Docker)` 19 live passed / 0 skipped plus 64 passed in the
+non-live half; `Frontend (typecheck + build)` passed.
+
 GitHub Actions run **39579100724** for commit `5384608` — **success**, all four
 jobs green, including the new `PostgreSQL gate (real server)`: 11 PostgreSQL
 tests passed against a `postgres:16-alpine` service with **zero skips**, and the
@@ -398,8 +405,9 @@ jobs green: `Backend tests (pytest)` (638 passed, 33 skipped, 0 failed),
 the non-live half), `Frontend (typecheck + build)`.
 
 - Implementation commits: `f30e6a4` (`feat(v3): record provenance-aware events
-  and audit links behind a flag`) and `5384608` (`test(v3): verify Phase 1
-  against a real PostgreSQL server`), both pushed to `origin/main`.
+  and audit links behind a flag`), `5384608` (`test(v3): verify Phase 1
+  against a real PostgreSQL server`) and `9d1672b` (`fix(v3): retry PostgreSQL
+  concurrency conflicts by SQLSTATE`), all pushed to `origin/main`.
 - `v1.0.0` untouched; no release tag created.
 - Working tree clean after the documentation commit that records this report.
 
