@@ -815,9 +815,10 @@ strictly no weaker. "DoD" is the bar for merging.
   `attempted` + one terminal event; the V2 suite stays green.
 - **DoD:** events observable in a dev DB; flag off by default.
 
-**Status (2026-10-21): IMPLEMENTED — Phase 1 only.** Implementation commit
-`f30e6a4`; CI run `39554959798` green (backend 638 passed / 33 skipped, live Docker
-container gate 19 passed / 0 skipped, frontend build). Specification:
+**Status (2026-10-21): IMPLEMENTED AND VERIFIED — Phase 1 only.** Implementation
+commits `f30e6a4` and `5384608`; CI run `39579100724` green (backend 638 passed /
+41 skipped, live Docker container gate 19 passed / 0 skipped, PostgreSQL gate 11
+passed / 0 skipped against `postgres:16-alpine`, frontend build). Specification:
 `docs/v3-phase-1-spec.md`; results: `docs/v3-phase-1-acceptance.md`. What exists now:
 `services/graph/{schema,actions,provenance,events}.py`, `app/models/{graph_event,audit_link}.py`,
 `alembic/versions/003_graph_events_audit_links.py`, registry/adapter instrumentation, the
