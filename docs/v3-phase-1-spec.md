@@ -783,9 +783,13 @@ deployment that runs new code against an un-migrated database loses events, not 
 | Index size | n/a | 63-char identifier cap | names fixed, short |
 | Concurrent writes | database-level write lock | MVCC | writer retries on `OperationalError` "database is locked" (§8.2) |
 
-PostgreSQL behaviour is only verified where a real PG URL is supplied; CI uses SQLite. The
-PG-specific test is marked and skipped with an explicit reason when
-`RAIVISOX_TEST_POSTGRES_URL` is absent — **PG verification is NOT claimed** (§9, §11.1 R11).
+PostgreSQL behaviour is verified only where a real PG URL is supplied: `T34` plus the
+`test_postgres_phase1.py` gate cover schema, round-trip, the atomic audit/link write, FK
+cascades, legacy rows and restart. The `backend-tests` CI job uses SQLite; a dedicated
+`postgres-gate` job runs the PG tests against `postgres:16-alpine`. The PG-specific tests are
+marked and skipped with an explicit reason when `RAIVISOX_TEST_POSTGRES_URL` is absent — with
+no URL **PG verification is not claimed** (§9, §11.1 R11). A recorded PostgreSQL 16.9 run is in
+[v3-phase-1-acceptance.md](v3-phase-1-acceptance.md) §7.
 
 ### 7.7 Existing records
 
@@ -910,7 +914,8 @@ marked *existing*).
 | T31 | `test_artifact_events.py::test_artifact_event_absent_when_registration_fails` | force registration failure | run | no `artifact.registered`; existing `artifact_registration_failed` task event still emitted | no verified claim without the row |
 | T32 | `test_migration_003.py::test_upgrade_downgrade_round_trip_sqlite` | temp SQLite DB, env pinned | `alembic upgrade head` → `downgrade 002` → `upgrade head` | succeeds; `graph_events` + `audit_links` present/absent/present; `audit_events` DDL unchanged throughout | reversible, non-destructive migration |
 | T33 | `test_migration_003.py::test_existing_audit_rows_survive_upgrade` | DB at `002` with audit rows | upgrade to head | row count and every value unchanged; no link rows created; no `alter` ran on `audit_events` | legacy evidence is preserved verbatim |
-| T34 | `test_migration_003.py::test_postgres_migration_and_events` (marked, skipped without PG) | `RAIVISOX_TEST_POSTGRES_URL` set | upgrade + emit | same schema/behaviour on PG | PG is otherwise unverified — see §7.6 |
+| T34 | `test_migration_003.py::test_postgres_migration_and_events` (marked, skipped without PG) | `RAIVISOX_TEST_POSTGRES_URL` set | upgrade + inspect | same schema on PG; `audit_events` unchanged | the PG schema is the migrated one, not `create_all` |
+| T34b–T34i | `test_postgres_phase1.py` (marked, skipped without PG) | a PG role with `CREATEDB` | migrate, emit, flush, restart | constraints and cascade rules; round-trip; dedupe + forged-owner refusal; atomic audit/link; FK enforcement; legacy row preserved and unlinked; restart keeps rows and never reuses a `seq`; a real `fs_read` run links both | PG behaviour is evidenced, not argued |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | unchanged | run | still passes (zero drift) | model and migration cannot diverge |
 | T36 | Existing suites (`tests/unit/*`, live container gate) | unchanged | run | all previously passing tests still pass; counts unchanged | no regression to authorization, sandbox, quotas, digest pinning |
 
@@ -924,7 +929,9 @@ Additional non-functional assertions:
 
 ### 9.1 Explicitly not tested / not claimed
 
-- PostgreSQL migration is **not verified** unless a PG URL is provided (CI has none).
+- PostgreSQL is **not verified** unless a PG URL is provided: the SQLite
+  `backend-tests` job skips the PG-gated tests. A recorded PostgreSQL 16.9 run is in the
+  acceptance report, and the CI `postgres-gate` job repeats it.
 - Sandboxed child I/O remains unobservable; no test asserts events for it.
 - Multi-replica clock skew is not exercised.
 
@@ -976,7 +983,7 @@ the registry so no event is ever written with an unverified `user_id`.
 | R8 | `Integer` `seq` ceiling (~2.1B) | future table rebuild | ≈ 49 years at design §10 volume; monitor `max(seq)`; D6 |
 | R9 | A compromised adapter lies in its `observed` events | misleading graph | `evidence_class` stays `observed`; only artifact registration is `verified`; Phase 4 forbids promotion |
 | R10 | Provenance resolution adds one query per run | negligible | once per run, not per event |
-| R11 | PostgreSQL path is unverified in CI (SQLite-only) | a PG-only DDL defect could reach production | T34 gated on `RAIVISOX_TEST_POSTGRES_URL`; marked NOT VERIFIED until a PG run is recorded |
+| R11 | a PG-only DDL/behaviour defect can pass the SQLite suite | a PG regression reaches production unnoticed | T34 + `test_postgres_phase1.py` gated on `RAIVISOX_TEST_POSTGRES_URL`, verified on PostgreSQL 16.9 (acceptance report §7) and run on every push by the CI `postgres-gate` job, which fails on any skip |
 | R12 | SQLite runs without `PRAGMA foreign_keys`, so FKs are declarative there | a reader might over-trust the constraint | the guarantees are the writer's single transaction (T18b) and the run-start ownership check (T13–T17); PG enforces the FKs |
 
 ### 11.2 Decision summary (all 12 classified)

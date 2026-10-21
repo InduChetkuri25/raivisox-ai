@@ -7,6 +7,7 @@ provided; otherwise the test skips and the limitation is reported.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import subprocess
@@ -177,7 +178,10 @@ _PG_URL = os.environ.get("RAIVISOX_TEST_POSTGRES_URL", "").strip()
     not _PG_URL, reason="RAIVISOX_TEST_POSTGRES_URL not set — PostgreSQL is unverified"
 )
 def test_postgres_migration_and_events():
-    from sqlalchemy import create_engine, inspect
+    from sqlalchemy import inspect
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
 
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([_REPO, _API])
@@ -192,16 +196,33 @@ def test_postgres_migration_and_events():
     )
     assert proc.returncode == 0, (proc.stdout or "")[-2000:] + (proc.stderr or "")[-2000:]
 
-    sync_url = _PG_URL.replace("+asyncpg", "+psycopg2").replace(
-        "+aiosqlite", ""
+    # Inspect with asyncpg — the driver this project declares — so the check
+    # does not require psycopg2, which is not a declared dependency.
+    url = make_url(_PG_URL)
+    if url.drivername in {"postgres", "postgresql"}:
+        url = url.set(drivername="postgresql+asyncpg")
+    async_url = url.render_as_string(hide_password=False)
+
+    async def _read_schema() -> tuple[set[str], set[str]]:
+        engine = create_async_engine(async_url, poolclass=NullPool)
+        try:
+            async with engine.connect() as conn:
+                def _read(sync_conn) -> tuple[set[str], set[str]]:
+                    inspector = inspect(sync_conn)
+                    return (
+                        set(inspector.get_table_names()),
+                        {
+                            column["name"]
+                            for column in inspector.get_columns("audit_events")
+                        },
+                    )
+
+                return await conn.run_sync(_read)
+        finally:
+            await engine.dispose()
+
+    tables, audit_cols = asyncio.run(_read_schema())
+    assert _NEW_TABLES <= tables
+    assert not ({"user_id", "task_id", "run_id"} & audit_cols), (
+        "audit_events must stay unchanged on PostgreSQL too"
     )
-    engine = create_engine(sync_url)
-    try:
-        tables = set(inspect(engine).get_table_names())
-        assert _NEW_TABLES <= tables
-        audit_cols = {c["name"] for c in inspect(engine).get_columns("audit_events")}
-        assert not ({"user_id", "task_id", "run_id"} & audit_cols), (
-            "audit_events must stay unchanged on PostgreSQL too"
-        )
-    finally:
-        engine.dispose()

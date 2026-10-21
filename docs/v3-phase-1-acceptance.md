@@ -20,7 +20,7 @@ or graph UI exists in this change.
 | Failure semantics (flag-off, missing table, write error) | **PASS** |
 | Retry / rollback / restart persistence | **PASS** |
 | Legacy audit compatibility (`audit_events` untouched) | **PASS** |
-| PostgreSQL migration + events (T34) | **NOT VERIFIED** — no PG instance available |
+| PostgreSQL migration, events, audit links (T34, T34b–T34i) | **PASS** — real PostgreSQL 16.9; see §7 |
 | Live Linux container gate | **CI only** — no Docker/WSL on the dev host; see §7 |
 | Flag default | `V3_EVENTS_ENABLED` **off**, unchanged |
 
@@ -39,7 +39,7 @@ New:
   failure classification, retry policy, process-level disable on missing table.
 - `apps/api/app/models/graph_event.py`, `apps/api/app/models/audit_link.py`.
 - `apps/api/alembic/versions/003_graph_events_audit_links.py`.
-- `tests/unit/{test_graph_events,test_provenance,test_audit_linkage,test_fs_read_instrumentation,test_endpoint_instrumentation,test_workspace_quota_integration,test_artifact_events,test_migration_003}.py`
+- `tests/unit/{test_graph_events,test_provenance,test_audit_linkage,test_fs_read_instrumentation,test_endpoint_instrumentation,test_workspace_quota_integration,test_artifact_events,test_migration_003,test_postgres_phase1}.py`
   plus `tests/unit/v3_phase1_helpers.py`.
 - This report.
 
@@ -201,14 +201,25 @@ per-file evidence in §6.
 | T31 | `test_artifact_events.py::test_artifact_event_absent_when_registration_fails` | PASS |
 | T32 | `test_migration_003.py::test_upgrade_downgrade_round_trip_sqlite` | PASS |
 | T33 | `test_migration_003.py::test_existing_audit_rows_survive_upgrade` | PASS |
-| T34 | `test_migration_003.py::test_postgres_migration_and_events` | **SKIP** — `RAIVISOX_TEST_POSTGRES_URL` unset |
+| T34 | `test_migration_003.py::test_postgres_migration_and_events` | **PASS** — PostgreSQL 16.9 |
+| T34b | `test_postgres_phase1.py::test_postgres_migration_creates_v3_schema` | PASS — both tables, unique keys, all indexes, both `ON DELETE CASCADE` rules, `seq` default `nextval(...)` |
+| T34c | `test_postgres_phase1.py::test_postgres_upgrade_downgrade_round_trip` | PASS — `upgrade → downgrade 002 → upgrade`; `audit_events` columns identical throughout |
+| T34d | `test_postgres_phase1.py::test_postgres_emit_persists_and_deduplicates` | PASS — append, duplicate no-op, forged owner refused (`ProvenanceError`, no row) |
+| T34e | `test_postgres_phase1.py::test_postgres_audit_link_is_atomic` | PASS — failed link insert leaves 0 audit rows, 0 links, queue intact; retry writes both |
+| T34f | `test_postgres_phase1.py::test_postgres_foreign_keys_are_enforced` | PASS — orphan link refused; task delete cascades events; audit delete cascades links |
+| T34g | `test_postgres_phase1.py::test_postgres_legacy_audit_rows_survive_upgrade` | PASS — pre-V3 row byte-identical after upgrade, no link row, reads as `NULL` provenance |
+| T34h | `test_postgres_phase1.py::test_postgres_restart_preserves_events_and_seq` | PASS — rows survive a restart in `seq` order; a deleted `seq` is never reissued |
+| T34i | `test_postgres_phase1.py::test_postgres_registry_read_records_event_and_link` | PASS — a real `fs_read` run produces the event, the audit row and its link |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | PASS |
 | T36 | Existing suites (`tests/unit/**`) | PASS — see §6 |
 | — | `test_graph_events.py::test_emit_cost_is_bounded` (non-functional) | PASS |
 | — | `test_audit_linkage.py::test_kernel_call_sites_still_work_without_new_kwargs` | PASS |
 | — | `test_audit_linkage.py::test_links_never_contain_content_or_secret` | PASS |
 
-**44 passed, 1 skipped, 0 failed** across the eight Phase 1 files.
+**44 passed, 1 skipped, 0 failed** across the eight Phase 1 files without a
+PostgreSQL URL. With `RAIVISOX_TEST_POSTGRES_URL` set the same selection plus
+`test_postgres_phase1.py` is **53 passed, 0 skipped, 0 failed** — the nine
+PostgreSQL-gated tests run instead of skipping.
 
 ## 6. Verification runs
 
@@ -218,14 +229,17 @@ pytest 9.1.1):
 | Run | Command | Result |
 |---|---|---|
 | Phase 1 focused | `python -m pytest tests/unit/test_graph_events.py tests/unit/test_provenance.py tests/unit/test_audit_linkage.py tests/unit/test_fs_read_instrumentation.py tests/unit/test_endpoint_instrumentation.py tests/unit/test_workspace_quota_integration.py tests/unit/test_artifact_events.py tests/unit/test_migration_003.py -q` | 44 passed, 1 skipped |
-| Full backend | `python -m pytest tests/unit -q` | **618 passed, 49 skipped, 0 failed** (632 s) |
+| Phase 1 focused, with PostgreSQL | same selection plus `tests/unit/test_postgres_phase1.py`, `RAIVISOX_TEST_POSTGRES_URL` set | **53 passed, 0 skipped** |
+| PostgreSQL migration + PG gate | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q` | **11 passed, 0 skipped** |
+| Full backend | `python -m pytest tests/unit -q` | **619 passed, 56 skipped, 0 failed** (675 collected, 727 s; see §7 for the PG run) |
 | Container gate, non-live half | `python -m pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py -m "not live" -q` | 62 passed, 5 skipped, 19 deselected |
 | Frontend typecheck | `cd apps/web && npx tsc --noEmit` | exit 0, no diagnostics |
 | Frontend production build | `cd apps/web && npm run build` (`next build`, Next 15.1.6) | exit 0, 6 routes generated |
 | Full backend (baseline, pre-change, for comparison) | same suite at `014fcd6` | 618 passed, 49 skipped |
 
 Skips are pre-existing environment skips (Windows-only variants, no Ollama, no
-Docker, no PG) plus T34.
+Docker) plus the nine PostgreSQL-gated tests (T34, T34b–T34i) when no PG URL is
+supplied. The PostgreSQL run that executes them is in §7.
 
 Linux CI (`ubuntu-latest`) for the same commit, from the run's logs:
 
@@ -251,12 +265,55 @@ passes locally fails there.
   `28.0.4`, 19 live container tests passed and **zero skipped** (the job fails
   on any skip), 64 passed / 3 skipped in the non-live half. This is the
   authoritative Linux container evidence.
-- **PostgreSQL.** No PostgreSQL instance and no `RAIVISOX_TEST_POSTGRES_URL`
-  are available (CI has no PG service either), so T34 skipped and PostgreSQL
-  remains **NOT VERIFIED**. The migration and models are written for both
-  dialects (no SQLite-only DDL, `sqlite_autoincrement` is an ignored option on
-  PG, `AUTOINCREMENT` equivalents come from the dialect) but that is a design
-  argument, not evidence.
+- **PostgreSQL (verified).** The PostgreSQL path was verified against a real
+  server: PostgreSQL **16.9**, the same major version as the `postgres:16-alpine`
+  service the compose files ship. The instance was a throwaway cluster reachable
+  only on `127.0.0.1`, with trust auth scoped to that loopback address; no
+  credential was written to the repository, the URL was exported only into the
+  test process environment, and the cluster was stopped and deleted after the
+  run.
+
+  | Run | Result |
+  |---|---|
+  | `test_migration_003.py` (T32–T34) with the PG URL | **3 passed, 0 skipped** |
+  | `test_postgres_phase1.py` (T34b–T34i) | **8 passed, 0 skipped** |
+  | Phase 1 focused suite with the PG URL (§5) | **53 passed, 0 skipped** |
+  | Full backend suite without the PG URL (§6) | **619 passed, 56 skipped, 0 failed** |
+
+  What the PostgreSQL run proves, in the server's own terms: migration `003`
+  creates both tables with their unique keys, all nine indexes, both
+  `ON DELETE CASCADE` rules and a `nextval(...)` default for `seq`;
+  `upgrade → downgrade 002 → upgrade` round-trips and never alters
+  `audit_events`; the writer appends, deduplicates by `idempotency_key` and
+  refuses a forged owner with `ProvenanceError` and no row; a failed
+  `audit_links` insert leaves neither the audit row nor the link and keeps the
+  event queued for retry; PostgreSQL enforces the foreign keys (an orphan link is
+  refused, deleting a task cascades its events, deleting an audit row cascades
+  its link); a pre-V3 audit row is byte-identical after the upgrade and reads as
+  `NULL` provenance; a restart keeps every row in `seq` order and a deleted
+  `seq` is never reissued; and a real `fs_read` adapter run produces the event,
+  the audit row and its link.
+
+  Reproduce (PostgreSQL 13+, role needs `CREATEDB`: the tests create and drop
+  their own throwaway databases; T34 additionally migrates the database named in
+  the URL):
+
+  ```bash
+  createdb -h 127.0.0.1 -U "$PGUSER" raivisox_v3_test
+  RAIVISOX_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@127.0.0.1:5432/raivisox_v3_test \
+    python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q
+  ```
+
+  Without the variable, all nine PostgreSQL-gated tests skip with an explicit
+  reason and the report says PostgreSQL is unverified — a skip is never a pass.
+  The CI workflow now runs this same gate against a `postgres:16-alpine` service
+  in the `postgres-gate` job (result in §11); that job fails if any of the nine
+  tests skips, so a future PG regression cannot pass CI silently (R11). Nothing
+  in the suite claims a PG guarantee from SQLite evidence.
+- **Driver.** T34 previously inspected the migrated schema through
+  `postgresql+psycopg2`, but `psycopg2` is not a declared dependency of this
+  project (only `asyncpg` is). It now inspects with asyncpg — the assertions are
+  unchanged — so the PG gate does not silently require an undeclared package.
 
 ## 8. Security review of the diff
 
@@ -286,7 +343,10 @@ Nothing here is a human approval of those gates.
 
 ## 10. Limits and rollback
 
-- PostgreSQL unverified (T34).
+- PostgreSQL is verified on 16.9 by the opt-in run above and by the CI
+  `postgres-gate` job (§11), but only on that major version: no PG
+  concurrency/lock-contention or multi-version run was performed. SQLite
+  remains the dialect every other test uses.
 - Child-process I/O, header/body contents, resolved IPs, clock skew: out of
   scope by design and not claimed.
 - Rollback is `alembic downgrade 002`, which drops the two new tables and
@@ -309,6 +369,7 @@ the non-live half), `Frontend (typecheck + build)`.
 
 ## 12. Verdict
 
-`V3 PHASE 1: PASSED` — with one recorded limitation (PostgreSQL NOT VERIFIED,
-T34 skipped because no instance is available) and the three owner gates G1–G3
-still open. Phase 2 has not been started.
+`V3 PHASE 1: PASSED` — every Phase 1 acceptance item is now evidenced, including
+the PostgreSQL path (T34, T34b–T34i on a real PostgreSQL 16.9 server, and the CI
+`postgres-gate` job that keeps it verified). The three owner gates G1–G3 remain
+open, and Phase 2 has not been started.

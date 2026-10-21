@@ -821,11 +821,13 @@ container gate 19 passed / 0 skipped, frontend build). Specification:
 `docs/v3-phase-1-spec.md`; results: `docs/v3-phase-1-acceptance.md`. What exists now:
 `services/graph/{schema,actions,provenance,events}.py`, `app/models/{graph_event,audit_link}.py`,
 `alembic/versions/003_graph_events_audit_links.py`, registry/adapter instrumentation, the
-`audit_links` side table, and 44 Phase 1 acceptance tests. `audit_events` is unchanged (no
-linkage columns); legacy rows read as `NULL` provenance and are never backfilled.
-`V3_EVENTS_ENABLED` remains **off by default**; production enablement is operational gate
-G1. Not implemented (Phase 2+): projection, graph store, blast radius, policy engine,
-approval flow, graph UI. PostgreSQL is designed for, not verified (no PG instance in CI).
+`audit_links` side table, and 53 Phase 1 acceptance tests (44 on a SQLite-only host; nine are
+PostgreSQL-gated). `audit_events` is unchanged (no linkage columns); legacy rows read as
+`NULL` provenance and are never backfilled. `V3_EVENTS_ENABLED` remains **off by default**;
+production enablement is operational gate G1. Not implemented (Phase 2+): projection, graph
+store, blast radius, policy engine, approval flow, graph UI. PostgreSQL 16.9 is verified
+through the opt-in gate (`RAIVISOX_TEST_POSTGRES_URL`: T34, T34b–T34i), and the CI
+`postgres-gate` job runs that gate against `postgres:16-alpine` on every push.
 
 ### Phase 2 — Durable store and graph projection
 
@@ -953,7 +955,7 @@ approval flow, graph UI. PostgreSQL is designed for, not verified (no PG instanc
 | Hardlink redirection and writes by running children can exceed the quota | **PARTIAL** — documented, inodes counted once, no interception | sandbox-design §5.1; `test_hardlinked_inode_is_counted_once` |
 | Container image toolchain not minimal (`python:3.12-slim` ships `pip`) | **PARTIAL** — digest pinned, toolchain still general | `services/execution/image_pins.py`; `APPROVED_IMAGES`; live gate |
 | Digest verification needs registry access; must fail closed offline | **PASS** for the documented behaviour — refusal, pull failure, and mismatch all fail closed; the explicit override is reported as `image_pinned: false` | `tests/unit/test_image_pins.py` (policy refusal, pull/inspect/mismatch, override flag) |
-| V3 Phase 1 (event schema + emission + audit linkage) | **VERIFIED** — 44 acceptance tests locally, Linux CI green (backend suite + live container gate), SQLite migrations; **PostgreSQL unverified** | `docs/v3-phase-1-acceptance.md` §5–§7, §11 |
+| V3 Phase 1 (event schema + emission + audit linkage) | **VERIFIED** — 53 acceptance tests (44 SQLite + 9 PostgreSQL-gated) passing locally including a real PostgreSQL 16.9 run, Linux CI green (backend suite + live container gate) | `docs/v3-phase-1-acceptance.md` §5–§7, §11 |
 | V3 Phases 2–6 (projection, graph store, blast radius, policy, approval, UI) | **NOT IMPLEMENTED** — design only; no code, no tests | this document §13 |
 
 No concrete security **regression** was found while inspecting for this design. Two
