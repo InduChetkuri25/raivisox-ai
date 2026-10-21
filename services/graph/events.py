@@ -11,6 +11,11 @@ Properties this module guarantees:
 - **Idempotent.** ``idempotency_key`` is deterministic; a retried write is a
   no-op, a second execution is a distinct action.
 - **Append-only.** No update/delete helper exists.
+- **Dialect-aware retries.** Only *concurrency conflicts* are retried, decided
+  by the driver's SQLSTATE on PostgreSQL (class ``40``: ``40P01`` deadlock,
+  ``40001`` serialization failure; plus ``55P03``) and by SQLite's lock
+  message on SQLite. Each retry opens a fresh transaction; constraint,
+  provenance, input and connection/configuration errors are never retried.
 - **Default off.** ``V3_EVENTS_ENABLED`` gates everything (design §13).
 """
 
@@ -21,9 +26,9 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
-from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 
 from services.graph import actions, schema
 from services.graph.provenance import ProvenanceError, verify_subject
@@ -31,6 +36,27 @@ from services.graph.provenance import ProvenanceError, verify_subject
 logger = logging.getLogger("raivisox.graph.events")
 
 TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Retry policy (spec §8.2): at most three attempts, 50 ms then 200 ms.
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = (0.05, 0.2)
+
+# Concurrency conflicts a retry can safely resolve. PostgreSQL aborts the
+# *whole transaction* for these (class 40) and guarantees nothing in it was
+# committed, so the only correct response is a fresh transaction; retrying a
+# single statement inside the aborted one would just raise "current transaction
+# is aborted". 55P03 (lock_not_available) is the same shape: nobody's work was
+# lost, the lock was simply not obtainable this instant.
+_TRANSIENT_SQLSTATES = frozenset({"40001", "40P01", "55P03"})
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"40"})  # transaction rollback
+_MISSING_TABLE_SQLSTATES = frozenset({"42P01", "3F000"})  # undefined table/schema
+
+# SQLite reports lock contention as text and never as a SQLSTATE.
+_SQLITE_LOCK_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+)
 
 _COUNTER_KEYS = (
     "written",
@@ -198,19 +224,10 @@ async def emit(
     factory = session_factory or _factory()
 
     # --- ownership verification (one query, authoritative rows) -----------
-    try:
-        async with factory() as session:
-            owned = await verify_subject(
-                session, task_id=task_id, user_id=user_id, run_id=run_id
-            )
-    except OperationalError as exc:
-        _inc("failures")
-        _maybe_disable(exc)
-        _safe_warn("ownership check failed", event_type, exc)
-        return False
-    except SQLAlchemyError as exc:  # pragma: no cover - defensive
-        _inc("failures")
-        _safe_warn("ownership check failed", event_type, exc)
+    owned = await _check_ownership(
+        factory, task_id=task_id, user_id=user_id, run_id=run_id, event_type=event_type
+    )
+    if owned is None:
         return False
     if not owned:
         raise ProvenanceError(
@@ -247,36 +264,37 @@ async def emit(
             payload_hash=digest,
         )
 
-    for attempt in range(3):
-        try:
-            async with factory() as session:
-                session.add(_row())
-                await session.commit()
-            _inc("written")
-            return True
-        except IntegrityError:
-            # Deterministic key already stored: the fact is recorded once.
-            _inc("duplicates")
-            return True
-        except OperationalError as exc:
-            if _is_missing_table(exc):
-                _inc("failures")
-                _maybe_disable(exc)
-                _safe_warn("event table missing", event_type, exc)
-                return False
-            if _is_transient_lock(exc) and attempt < 2:
-                _inc("retries")
-                await asyncio.sleep(0.05 if attempt == 0 else 0.2)
-                continue
+    async def _insert() -> None:
+        # A fresh session (and therefore a fresh transaction) per attempt:
+        # after 40P01/40001 the old transaction is aborted server-side, so
+        # continuing inside it is never an option.
+        async with factory() as session:
+            session.add(_row())
+            await session.commit()
+
+    try:
+        await _retry_transient(_insert)
+    except IntegrityError:
+        # Deterministic key already stored: the fact is recorded once. This is
+        # also what a retry lands on when a previous attempt did commit but
+        # lost its connection before reporting success.
+        _inc("duplicates")
+        return True
+    except DBAPIError as exc:
+        if _is_missing_table(exc):
             _inc("failures")
-            _safe_warn("event write failed", event_type, exc)
+            _maybe_disable(exc)
+            _safe_warn("event table missing", event_type, exc)
             return False
-        except SQLAlchemyError as exc:  # pragma: no cover - defensive
-            _inc("failures")
-            _safe_warn("event write failed", event_type, exc)
-            return False
-    _inc("failures")
-    return False
+        _inc("failures")
+        _safe_warn("event write failed", event_type, exc)
+        return False
+    except SQLAlchemyError as exc:  # pragma: no cover - defensive
+        _inc("failures")
+        _safe_warn("event write failed", event_type, exc)
+        return False
+    _inc("written")
+    return True
 
 
 async def read_events(
@@ -343,17 +361,90 @@ async def read_events(
 # --- failure classification ------------------------------------------------
 
 
-def _is_missing_table(exc: OperationalError) -> bool:
+def _sqlstate(exc: BaseException) -> Optional[str]:
+    """Return the SQLSTATE a driver attached to ``exc``, if it attached one.
+
+    Drivers disagree on the attribute name (``sqlstate`` for asyncpg and
+    psycopg3, ``pgcode`` for psycopg2) and on where the driver exception sits
+    (``DBAPIError.orig``, or one of the ``__cause__``/``__context__`` links),
+    so the whole chain is inspected rather than one guessed slot. Structured
+    codes only: a message that merely *mentions* a state is not evidence.
+    """
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        try:
+            for attr in ("sqlstate", "pgcode"):
+                value = getattr(current, attr, None)
+                if isinstance(value, str) and len(value) == 5:
+                    return value.upper()
+            for attr in ("orig", "__cause__", "__context__", "asyncpg_error"):
+                nested = getattr(current, attr, None)
+                if isinstance(nested, BaseException):
+                    stack.append(nested)
+        except Exception:  # pragma: no cover - a hostile driver attribute
+            continue
+    return None
+
+
+def _is_missing_table(exc: BaseException) -> bool:
+    if _sqlstate(exc) in _MISSING_TABLE_SQLSTATES:
+        return True
     text = str(exc).lower()
     return "no such table" in text or "does not exist" in text
 
 
-def _is_transient_lock(exc: OperationalError) -> bool:
+def _is_transient_lock(exc: BaseException) -> bool:
+    """True only for concurrency conflicts a bounded retry can resolve.
+
+    PostgreSQL evidence comes from the driver's SQLSTATE: class 40 (deadlock
+    detected ``40P01``, serialization failure ``40001``) and ``55P03``
+    (``lock_not_available``). SQLite keeps its message-based rule. Anything
+    else — constraint violations, authorization errors, bad configuration, a
+    closed or unreachable server — is *not* transient and must not be retried:
+    retrying those only delays an honest failure.
+    """
+    state = _sqlstate(exc)
+    if state is not None:
+        return state in _TRANSIENT_SQLSTATES or state[:2] in _TRANSIENT_SQLSTATE_CLASSES
     text = str(exc).lower()
-    return "database is locked" in text or "database table is locked" in text
+    return any(marker in text for marker in _SQLITE_LOCK_MARKERS)
 
 
-def _maybe_disable(exc: OperationalError) -> None:
+def _attempt_delay(attempt: int) -> float:
+    """Backoff for ``attempt`` (0-based), bounded by the published schedule."""
+    return _BACKOFF_SECONDS[min(attempt, len(_BACKOFF_SECONDS) - 1)]
+
+
+async def _retry_transient(operation: Callable[[], Awaitable[Any]]) -> Any:
+    """Await ``operation``, retrying only transient concurrency conflicts.
+
+    ``operation`` must open its own session/transaction: a retry restarts the
+    *whole* transaction, because PostgreSQL has already aborted the previous
+    one (a single statement retried inside it would fail with 25P02).
+
+    Bounded by ``_MAX_ATTEMPTS`` with the published backoff, so a persistent
+    conflict surfaces instead of spinning. The final database error is
+    propagated unchanged to the caller, as is ``CancelledError`` during the
+    backoff (shutdown must not be delayed by retries). Non-transient errors
+    are raised on the first attempt.
+    """
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return await operation()
+        except DBAPIError as exc:
+            if not _is_transient_lock(exc) or attempt >= _MAX_ATTEMPTS - 1:
+                raise
+            _inc("retries")
+            await asyncio.sleep(_attempt_delay(attempt))
+    raise AssertionError("unreachable: the loop returns or raises")  # pragma: no cover
+
+
+def _maybe_disable(exc: BaseException) -> None:
     """A missing event table disables recording for this process (spec §8.1)."""
     global _disabled
     if _is_missing_table(exc) and not _disabled:
@@ -362,6 +453,41 @@ def _maybe_disable(exc: OperationalError) -> None:
             "graph event recording disabled for this process: %s",
             type(exc).__name__,
         )
+
+
+async def _check_ownership(
+    factory: Callable[[], Any],
+    *,
+    task_id: str,
+    user_id: str,
+    run_id: Optional[str],
+    event_type: str,
+) -> Optional[bool]:
+    """Verify the subject, retrying only transient concurrency errors.
+
+    Returns the verdict (``True``/``False``), or ``None`` when the check itself
+    could not run — already counted and logged here. Each attempt uses a fresh
+    session, so a retried check never resumes an aborted transaction.
+    """
+
+    async def _check() -> bool:
+        async with factory() as session:
+            return await verify_subject(
+                session, task_id=task_id, user_id=user_id, run_id=run_id
+            )
+
+    try:
+        return await _retry_transient(_check)
+    except DBAPIError as exc:
+        _inc("failures")
+        if _is_missing_table(exc):
+            _maybe_disable(exc)
+        _safe_warn("ownership check failed", event_type, exc)
+        return None
+    except SQLAlchemyError as exc:  # pragma: no cover - defensive
+        _inc("failures")
+        _safe_warn("ownership check failed", event_type, exc)
+        return None
 
 
 def _safe_warn(message: str, event_type: str, exc: BaseException) -> None:

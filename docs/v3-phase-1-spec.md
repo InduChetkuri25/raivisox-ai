@@ -781,7 +781,7 @@ deployment that runs new code against an un-migrated database loses events, not 
 | Schema change kind | `CREATE TABLE` only | `CREATE TABLE` only | no `batch_alter_table`, no `ALTER`, so neither dialect's column-alter limits apply |
 | FK enforcement | **declared only** — no `PRAGMA foreign_keys` in this repo | enforced | the atomic write (§5.1) and the run-start ownership check are the guarantees; tests assert behaviour, not the constraint |
 | Index size | n/a | 63-char identifier cap | names fixed, short |
-| Concurrent writes | database-level write lock | MVCC | writer retries on `OperationalError` "database is locked" (§8.2) |
+| Concurrent writes | database-level write lock | MVCC, `40P01`/`40001` | writer retries only concurrency conflicts, classified by SQLSTATE on PG and by message on SQLite (§8.2) |
 
 PostgreSQL behaviour is verified only where a real PG URL is supplied: `T34` plus the
 `test_postgres_phase1.py` gate cover schema, round-trip, the atomic audit/link write, FK
@@ -815,8 +815,9 @@ audit endpoints continuing to work. The first read API arrives in Phase 2/4
 | `graph_events` table absent (migration not applied) | writer catches, disables itself for the process | `graph_events_write_failures` + one warning per process | no |
 | `ctx` has no provenance (direct adapter use) | event skipped | `graph_events_skipped_no_provenance` | no |
 | Duplicate `idempotency_key` (`IntegrityError`) | treated as success (already recorded) | `graph_events_duplicates` | no |
-| Transient DB error (`OperationalError`, "database is locked") | retry ×2 with 50 ms / 200 ms backoff on a fresh session | `graph_events_retries`; on final failure `graph_events_write_failures` | no |
-| Non-transient DB error | no retry | `graph_events_write_failures` + safe warning (event type, task id, error class — no payload) | no |
+| Transient concurrency conflict — PG SQLSTATE class `40` (`40P01` deadlock, `40001` serialization failure) plus `55P03`, or SQLite "database is locked" | up to 3 attempts with 50 ms / 200 ms backoff, each in a **fresh session/transaction**; the provenance read follows the same rule | `graph_events_retries`; on final failure `graph_events_write_failures` | no |
+| Non-transient DB error (constraint `23xxx`, authorization `42501`, undefined table `42P01`, connection/configuration `08xxx`/`28P01`, cancelled `57014`) | no retry; a missing table additionally disables recording | `graph_events_write_failures` + safe warning (event type, task id, error class — no payload) | no |
+| Cancellation during a retry backoff | `CancelledError` propagates immediately; it is neither counted as a write failure nor swallowed | none | no (shutdown is not an observation failure) |
 | Payload invalid (unknown keys / oversized / secret heuristic hit) | event dropped, not rewritten | `graph_events_invalid` + warning naming the field | no |
 | `target_id` normalization fails | event kept with `target_id = NULL` | `graph_events_invalid_target` | no |
 | Provenance mismatch at run start | `ProvenanceError` raised **before steps** | run fails with an explicit error | **yes, deliberately** — an unprovable run must not execute |
@@ -826,9 +827,43 @@ audit endpoints continuing to work. The first read API arrives in Phase 2/4
 
 ### 8.2 Retry policy (concrete)
 
-`emit()` retries only `sqlalchemy.exc.OperationalError` and only twice (50 ms, 200 ms). It
-never retries `IntegrityError` (deduped) or validation errors. Retries reuse the same
-`event_id`/`idempotency_key`, so a retry cannot double-write.
+**Classification comes from the driver, not from the exception class alone.** `emit()`
+retries a `DBAPIError` only when it is a *concurrency conflict*:
+
+- PostgreSQL: the driver's SQLSTATE, read from `sqlstate`/`pgcode` on the original driver
+exception (the whole `orig`/`__cause__`/`__context__` chain is inspected, because drivers
+disagree on the attribute name and on where they wrap the error). Transient = class `40`
+(`40001` serialization failure, `40P01` deadlock detected) and `55P03`
+(`lock_not_available`). A SQLSTATE-shaped substring inside a message is not accepted as
+evidence.
+- SQLite: the existing message markers ("database is locked", "database table is locked",
+  "database schema is locked"), which is how that engine reports contention.
+
+Everything else is raised on the first attempt: constraint violations (`23xxx`), insufficient
+privilege (`42501`), undefined table (`42P01`, which instead disables recording for the
+process), failed connections (`08xxx`), authentication (`28P01`), `25P02`
+(`in_failed_sql_transaction` — the *effect* of an earlier abort, not a cause) and
+`57014` (cancelled). Retrying those would only delay an honest failure.
+
+**The transaction is always restarted.** Each attempt opens a new session, so a retried
+write never continues inside a transaction PostgreSQL has already aborted (that would fail
+with `25P02`). The number of attempts is bounded at three (two retries) with 50 ms and
+200 ms backoff; the backoff is `await`ed, so a shutdown cancels it and `CancelledError`
+propagates instead of being counted as a failure.
+
+**What a retry cannot do:** it reuses the same `event_id`/`idempotency_key`, so it cannot
+double-write; if the previous attempt did commit but lost its connection before reporting
+success, the retry collides on the unique key and is counted as a `duplicate` (the fact is
+recorded once). `IntegrityError` keeps that meaning. When the budget is exhausted the final
+database error propagates out of the retry boundary and `emit()` converts it to `False` +
+`graph_events_write_failures` — observation still never breaks execution (§8.1). The audit
+flusher is different on purpose: `AuditTrail.flush_pending` re-raises its final error and
+leaves the events queued for the next flush.
+
+Tests: `tests/unit/test_transient_retry.py` (classification table, bounded retries,
+propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34o` prove the
+same policy against a real PostgreSQL server, including a genuine deadlock (`40P01`) and a
+genuine SERIALIZABLE conflict (`40001`) produced by the server itself.
 
 ### 8.3 No partial events
 
@@ -916,6 +951,13 @@ marked *existing*).
 | T33 | `test_migration_003.py::test_existing_audit_rows_survive_upgrade` | DB at `002` with audit rows | upgrade to head | row count and every value unchanged; no link rows created; no `alter` ran on `audit_events` | legacy evidence is preserved verbatim |
 | T34 | `test_migration_003.py::test_postgres_migration_and_events` (marked, skipped without PG) | `RAIVISOX_TEST_POSTGRES_URL` set | upgrade + inspect | same schema on PG; `audit_events` unchanged | the PG schema is the migrated one, not `create_all` |
 | T34b–T34i | `test_postgres_phase1.py` (marked, skipped without PG) | a PG role with `CREATEDB` | migrate, emit, flush, restart | constraints and cascade rules; round-trip; dedupe + forged-owner refusal; atomic audit/link; FK enforcement; legacy row preserved and unlinked; restart keeps rows and never reuses a `seq`; a real `fs_read` run links both | PG behaviour is evidenced, not argued |
+| T34j | `test_postgres_phase1.py::test_postgres_deadlock_is_classified_transient` | two transactions locking rows in opposite order (real PG) | cross-update | server aborts one with SQLSTATE `40P01`; the writer's classifier returns `True` and does not mistake it for a missing table | the deadlock path is proven by the server, not simulated |
+| T34k | `test_postgres_phase1.py::test_postgres_serialization_failure_is_classified_transient` | two SERIALIZABLE transactions reading, then writing, the same row | commit | one is aborted with `40001`; classifier returns `True` | serialization failures are retryable, and recognised |
+| T34l | `test_postgres_phase1.py::test_postgres_writer_retries_a_real_deadlock` | a `40P01` raised by the server on the first write attempt | `emit()` | one row written, one retry counted, no failure; a second emit of the same action is a duplicate | a retry cannot double-write or lose the fact |
+| T34m | `test_postgres_phase1.py::test_postgres_writer_gives_up_after_bounded_retries` | every attempt fails with `40P01` | `emit()` | `False`, 2 retries, 1 failure, 0 rows; recording is not disabled and a later emit succeeds | bounded, and a failure is not a reason to stop observing |
+| T34n | `test_postgres_phase1.py::test_postgres_writer_does_not_retry_permanent_error` | `payload_hash` column narrowed so the insert fails with `22001` | `emit()` | `False`, **0 retries**, 1 failure, 0 rows | a permanent server error is not treated as contention |
+| T34o | `test_postgres_phase1.py::test_postgres_audit_flush_retry_cannot_duplicate` | a real `40P01` at the flush commit | `flush_pending` twice | first attempt persists nothing and keeps both events queued; the retry writes 2 audit rows + 1 link exactly once; a third flush writes 0 | a transient failure cannot acknowledge or duplicate audit evidence |
+| T37 | `tests/unit/test_transient_retry.py` (34 tests, no server needed) | fake driver errors carrying `sqlstate`/`pgcode`, and a flaky session factory over real SQLite | classify + `emit()` | `40P01`/`40001`/`40000`/`55P03` transient; `23505`/`23503`/`42501`/`42P01`/`25P02`/`08xxx`/`28P01`/`57014` not; SQLite lock text still transient; bounded attempts; final error propagated to the caller; `CancelledError` not swallowed; duplicate still a duplicate | the policy is pinned on every host, including the classification table PG cannot enumerate cheaply |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | unchanged | run | still passes (zero drift) | model and migration cannot diverge |
 | T36 | Existing suites (`tests/unit/*`, live container gate) | unchanged | run | all previously passing tests still pass; counts unchanged | no regression to authorization, sandbox, quotas, digest pinning |
 

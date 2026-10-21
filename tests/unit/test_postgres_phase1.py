@@ -20,6 +20,7 @@ unverified, never silently "passing".
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import os
@@ -30,7 +31,7 @@ import uuid
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -695,3 +696,350 @@ async def test_postgres_registry_read_records_event_and_link(pg_stack):
     assert link["task_id"] == pg_stack.task_id
     assert link["run_id"] == pg_stack.run_id
     assert link["action_id"]
+
+# ---------------------------------------------------------------------------
+# Transient-error evidence — genuine server-produced SQLSTATEs
+# ---------------------------------------------------------------------------
+
+
+async def _capture_deadlock(url: str) -> DBAPIError:
+    """Provoke a real PostgreSQL deadlock and return the server's own error.
+
+    Two transactions each hold one row and then reach for the other's;
+    PostgreSQL's deadlock detector aborts one with SQLSTATE ``40P01``. Nothing
+    is mocked: the exception handed back is what asyncpg → SQLAlchemy raised,
+    including whatever SQLSTATE the driver attached to it.
+    """
+    engine = create_async_engine(url, poolclass=NullPool)
+    conn_a = conn_b = None
+    results: list = []
+    try:
+        async with engine.begin() as setup:
+            await setup.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS deadlock_probe "
+                    "(id integer PRIMARY KEY, v integer)"
+                )
+            )
+            await setup.execute(text("DELETE FROM deadlock_probe"))
+            await setup.execute(
+                text("INSERT INTO deadlock_probe (id, v) VALUES (1, 0), (2, 0)")
+            )
+
+        conn_a = await engine.connect()
+        conn_b = await engine.connect()
+        tx_a = await conn_a.begin()
+        tx_b = await conn_b.begin()
+        await conn_a.execute(text("UPDATE deadlock_probe SET v = v + 1 WHERE id = 1"))
+        await conn_b.execute(text("UPDATE deadlock_probe SET v = v + 1 WHERE id = 2"))
+
+        async def _cross_a():
+            return await conn_a.execute(
+                text("UPDATE deadlock_probe SET v = v + 1 WHERE id = 2")
+            )
+
+        async def _cross_b():
+            # Let A block first so the cycle is unambiguous.
+            await asyncio.sleep(0.3)
+            return await conn_b.execute(
+                text("UPDATE deadlock_probe SET v = v + 1 WHERE id = 1")
+            )
+
+        results = await asyncio.gather(_cross_a(), _cross_b(), return_exceptions=True)
+        for tx in (tx_a, tx_b):
+            try:
+                await tx.rollback()
+            except Exception:  # pragma: no cover - an already-aborted victim
+                pass
+    finally:
+        for conn in (conn_a, conn_b):
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:  # pragma: no cover - cleanup only
+                    pass
+        await engine.dispose()
+
+    errors = [result for result in results if isinstance(result, BaseException)]
+    assert len(errors) == 1, f"expected exactly one deadlock victim, got {errors!r}"
+    assert isinstance(errors[0], DBAPIError), type(errors[0])
+    return errors[0]
+
+
+async def _capture_serialization_failure(url: str) -> DBAPIError:
+    """Provoke a real SERIALIZABLE conflict and return SQLSTATE ``40001``."""
+    engine = create_async_engine(url, poolclass=NullPool)
+    conn_a = conn_b = None
+    error: DBAPIError | None = None
+    try:
+        async with engine.begin() as setup:
+            await setup.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS serial_probe "
+                    "(id integer PRIMARY KEY, v integer)"
+                )
+            )
+            await setup.execute(text("DELETE FROM serial_probe"))
+            await setup.execute(text("INSERT INTO serial_probe (id, v) VALUES (1, 0)"))
+
+        conn_a = await engine.connect()
+        conn_b = await engine.connect()
+        await conn_a.execution_options(isolation_level="SERIALIZABLE")
+        await conn_b.execution_options(isolation_level="SERIALIZABLE")
+        tx_a = await conn_a.begin()
+        tx_b = await conn_b.begin()
+        # Both read the same snapshot, then both write the same row: the second
+        # committer cannot be serialized and is aborted with 40001.
+        await conn_a.execute(text("SELECT v FROM serial_probe WHERE id = 1"))
+        await conn_b.execute(text("SELECT v FROM serial_probe WHERE id = 1"))
+        await conn_a.execute(text("UPDATE serial_probe SET v = v + 1 WHERE id = 1"))
+        await tx_a.commit()
+        try:
+            await conn_b.execute(text("UPDATE serial_probe SET v = v + 1 WHERE id = 1"))
+            await tx_b.commit()
+        except DBAPIError as exc:
+            error = exc
+            try:
+                await tx_b.rollback()
+            except Exception:  # pragma: no cover - already aborted
+                pass
+    finally:
+        for conn in (conn_a, conn_b):
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:  # pragma: no cover - cleanup only
+                    pass
+        await engine.dispose()
+
+    assert error is not None, "SERIALIZABLE conflict did not surface as a DBAPIError"
+    return error
+
+
+@pytest.fixture
+async def real_deadlock(migrated):
+    """A real 40P01 produced by the PostgreSQL deadlock detector."""
+    return await _capture_deadlock(migrated)
+
+
+class _FailingSession:
+    """Delegating session proxy that fails the next write attempt at commit.
+
+    Read-only work (the provenance check) passes through untouched, so the
+    injected error lands exactly on the transaction under test.
+    """
+
+    def __init__(self, session, queue):
+        self._session = session
+        self._queue = queue
+        self._error: DBAPIError | None = None
+
+    async def __aenter__(self):
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return await self._session.__aexit__(*exc_info)
+
+    def add(self, obj):
+        self._session.add(obj)
+        if self._error is None and self._queue:
+            self._error = self._queue.pop(0)
+
+    async def execute(self, *args, **kwargs):
+        return await self._session.execute(*args, **kwargs)
+
+    async def commit(self):
+        if self._error is not None:
+            raise self._error
+        return await self._session.commit()
+
+    async def rollback(self):
+        return await self._session.rollback()
+
+
+def _failing_factory(real_factory, errors):
+    """Factory feeding ``errors`` to the next ``len(errors)`` write attempts."""
+    queue = list(errors)
+
+    def _factory():
+        session = real_factory()
+        if queue:
+            return _FailingSession(session, queue)
+        return session
+
+    return _factory
+
+
+class _CommitFails:
+    """Session proxy used by ``flush_pending``: commit always raises."""
+
+    def __init__(self, session, error):
+        self._session = session
+        self._error = error
+
+    def add(self, obj):
+        self._session.add(obj)
+
+    async def execute(self, *args, **kwargs):
+        return await self._session.execute(*args, **kwargs)
+
+    async def commit(self):
+        raise self._error
+
+    async def rollback(self):
+        return await self._session.rollback()
+
+    async def close(self):
+        return await self._session.close()
+
+
+# ---------------------------------------------------------------------------
+# T34j — a real deadlock is recognised as transient (SQLSTATE 40P01)
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_deadlock_is_classified_transient(migrated, real_deadlock):
+    assert events._sqlstate(real_deadlock) == "40P01", (
+        f"driver did not expose the deadlock SQLSTATE: {real_deadlock!r}"
+    )
+    assert events._is_transient_lock(real_deadlock) is True
+    # A deadlock is not a missing table, and must not disable recording.
+    assert events._is_missing_table(real_deadlock) is False
+
+
+# ---------------------------------------------------------------------------
+# T34k — a real serialization failure is recognised as transient (40001)
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_serialization_failure_is_classified_transient(migrated):
+    exc = await _capture_serialization_failure(migrated)
+    assert events._sqlstate(exc) == "40001", (
+        f"driver did not expose the serialization SQLSTATE: {exc!r}"
+    )
+    assert events._is_transient_lock(exc) is True
+    assert events._is_missing_table(exc) is False
+
+
+# ---------------------------------------------------------------------------
+# T34l — the writer retries a server-raised deadlock and commits exactly once
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_retries_a_real_deadlock(pg_stack, real_deadlock):
+    factory = _failing_factory(pg_stack.factory, [real_deadlock])
+    action_id = live_action()
+
+    assert await emit_event(pg_stack, action_id=action_id, session_factory=factory) is True
+    assert events.counters()["retries"] == 1
+    assert events.counters()["written"] == 1
+    assert events.counters()["failures"] == 0
+
+    rows = await fetch_rows(pg_stack)
+    assert len(rows) == 1
+    assert rows[0]["action_id"] == action_id
+
+    # Idempotency survives the retry: the same fact is still one row.
+    assert (
+        await events.emit(
+            event_type=schema.TOOL_ATTEMPTED,
+            outcome=schema.ATTEMPTED,
+            actor_id="pipeline-service",
+            user_id=pg_stack.user_id,
+            task_id=pg_stack.task_id,
+            run_id=pg_stack.run_id,
+            step_node_id="step-1",
+            tool_id="fs_read",
+            action_id=action_id,
+            payload={"resource_ref": "task:x/step:y"},
+        )
+    ) is True
+    assert await count_rows(pg_stack) == 1
+    assert events.counters()["duplicates"] == 1
+
+
+# ---------------------------------------------------------------------------
+# T34m — bounded retries: three attempts, then an honest failure
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_gives_up_after_bounded_retries(pg_stack, real_deadlock):
+    factory = _failing_factory(pg_stack.factory, [real_deadlock for _ in range(5)])
+
+    assert await emit_event(pg_stack, session_factory=factory) is False
+    assert events.counters()["retries"] == 2, "two retries, three attempts in total"
+    assert events.counters()["failures"] == 1
+    assert await count_rows(pg_stack) == 0, "a failed transaction leaves no row"
+
+    # Exhausting the budget is not a reason to disable recording.
+    assert await emit_event(pg_stack, session_factory=pg_stack.factory) is True
+    assert await count_rows(pg_stack) == 1
+
+
+# ---------------------------------------------------------------------------
+# T34n — a permanent server error is not retried
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_does_not_retry_permanent_error(pg_stack):
+    # A genuine, permanent server error: the stored payload hash no longer fits
+    # its column, so PostgreSQL raises 22001 (string_data_right_truncation).
+    async with pg_stack.factory() as session:
+        await session.execute(
+            text("ALTER TABLE graph_events ALTER COLUMN payload_hash TYPE varchar(8)")
+        )
+        await session.commit()
+
+    assert await emit_event(pg_stack) is False
+    assert events.counters()["retries"] == 0, "a permanent error must not be retried"
+    assert events.counters()["failures"] == 1
+    assert await count_rows(pg_stack) == 0
+
+
+# ---------------------------------------------------------------------------
+# T34o — a transient failure keeps the audit queue intact and cannot duplicate
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_audit_flush_retry_cannot_duplicate(pg_stack, real_deadlock):
+    AuditTrail.instance().log(
+        actor_id="pipeline-service",
+        action="tool:fs_write",
+        resource="x",
+        allowed=True,
+        user_id=pg_stack.user_id,
+        task_id=pg_stack.task_id,
+        run_id=pg_stack.run_id,
+        step_node_id="step-1",
+        action_id=str(uuid.uuid4()),
+    )
+    AuditTrail.instance().log(
+        actor_id="legacy-actor", action="api:view_audit", resource="audit", allowed=True
+    )
+    assert AuditTrail.instance().pending_count() == 2
+
+    failing = _CommitFails(pg_stack.factory(), real_deadlock)
+    try:
+        with pytest.raises(DBAPIError):
+            await AuditTrail.instance().flush_pending(failing)
+    finally:
+        await failing.close()
+
+    # Nothing was acknowledged: the whole flush rolled back and stayed queued.
+    assert AuditTrail.instance().pending_count() == 2
+    assert await count_rows(pg_stack, "audit_events") == 0
+    assert await count_rows(pg_stack, "audit_links") == 0
+
+    # The retry writes each event exactly once, with its link.
+    async with pg_stack.factory() as session:
+        assert await AuditTrail.instance().flush_pending(session) == 2
+    assert AuditTrail.instance().pending_count() == 0
+    assert await count_rows(pg_stack, "audit_events") == 2
+    assert await count_rows(pg_stack, "audit_links") == 1
+
+    # A further flush is a no-op: no duplicate audit rows or links.
+    async with pg_stack.factory() as session:
+        assert await AuditTrail.instance().flush_pending(session) == 0
+    assert await count_rows(pg_stack, "audit_events") == 2
+    assert await count_rows(pg_stack, "audit_links") == 1
