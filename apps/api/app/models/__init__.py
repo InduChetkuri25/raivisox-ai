@@ -14,6 +14,8 @@ from app.models.verification_result import VerificationResult
 from app.models.recovery_attempt import RecoveryAttempt
 from app.models.audit_log import AuditLog
 from app.models.audit_event import AuditEventModel
+from app.models.audit_link import AuditLink
+from app.models.graph_event import GraphEvent
 from app.models.memory import Memory
 from app.models.skill import Skill
 
@@ -33,6 +35,8 @@ __all__ = [
     "RecoveryAttempt",
     "AuditLog",
     "AuditEventModel",
+    "AuditLink",
+    "GraphEvent",
     "Memory",
     "Skill",
 ]

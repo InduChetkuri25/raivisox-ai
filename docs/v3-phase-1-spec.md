@@ -496,7 +496,9 @@ Notes:
 
 - Success ⇒ `resource.write.committed` (`bytes`, `created`/`overwritten` derived from the
   tool output when present, `relpath`) + a **new** success audit entry
-  (`action="tool:fs_write", allowed=True`). D11 = `RESOLVED — SECURE DEFAULT`: a write
+  (`action="tool:fs_write", allowed=True`), emitted **only while `V3_EVENTS_ENABLED` is on**
+  — §3.1/T10 requires the flag-off audit stream to stay byte-identical, and existing suites
+  count `tool:fs_write` rows (T36). The same rule applies to the read success entry in §5.3. D11 = `RESOLVED — SECURE DEFAULT`: a write
   changes state, so an auditor restricted to `audit_events` must be able to see that it
   happened, not only that some writes were refused; the asymmetry (denials recorded, successes
   not) is an evidence hole. The entry carries no content. Cost: one extra audit row per
@@ -1116,6 +1118,9 @@ ones — an evidence hole for the operations that actually change state.
 higher-consequence class; symmetry is the minimum honest coverage, and the entry carries no
 content. Consequences: one extra audit row (and its `audit_links` row) per successful write;
 the existing batched flusher absorbs it; the graph event remains the analytical record.
+Implementation note (§5.4): the entry is written only while `V3_EVENTS_ENABLED` is on, because
+T10 requires flag-off behaviour to be unchanged and T36's existing suites count `tool:fs_write`
+audit rows. Flag-on evidence is richer; flag-off is byte-identical to V2.
 
 **D12 — the kernel exposes its `request_id`.** Options: (a) add
 `SecurityDecision.request_id`; (b) leave `correlation_id` null. (b) abandons the design's

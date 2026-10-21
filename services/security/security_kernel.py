@@ -34,6 +34,12 @@ class ActionContext:
     permissions_requested: list[str] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # V3 Phase 1 provenance (evidence only — never an input to the decision).
+    user_id: str | None = None
+    task_id: str | None = None
+    run_id: str | None = None
+    step_node_id: str | None = None
+    action_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +50,11 @@ class ActionContext:
             "resource": self.resource,
             "permissions_requested": self.permissions_requested,
             "timestamp": self.timestamp,
+            "user_id": self.user_id,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "step_node_id": self.step_node_id,
+            "action_id": self.action_id,
         }
 
 
@@ -56,6 +67,9 @@ class SecurityDecision:
     denied_permissions: list[str] = field(default_factory=list)
     reason: str = ""
     decision_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # The audit row's request id, exposed so a graph event can cite the exact
+    # decision that justified it (V3 spec D12). Empty when no decision ran.
+    request_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -137,6 +151,11 @@ class SecurityKernel:
             allowed=decision.allowed,
             request_id=context.request_id,
             details={"granted": decision.granted_permissions, "denied": decision.denied_permissions, "reason": decision.reason},
+            user_id=context.user_id,
+            task_id=context.task_id,
+            run_id=context.run_id,
+            step_node_id=context.step_node_id,
+            action_id=context.action_id,
         )
 
     def authorize_and_log(
@@ -146,17 +165,34 @@ class SecurityKernel:
         resource: str,
         permissions: list[str],
         actor_type: str = "user",
+        *,
+        user_id: str | None = None,
+        task_id: str | None = None,
+        run_id: str | None = None,
+        step_node_id: str | None = None,
+        action_id: str | None = None,
     ) -> SecurityDecision:
-        """Authorize an action and log the audit trail."""
+        """Authorize an action and log the audit trail.
+
+        The provenance keyword arguments are evidence only: they are written to
+        the audit link and echoed on the decision, and they never influence
+        `authorize()`. Existing callers are unaffected (all default to None).
+        """
         context = ActionContext(
             actor_id=actor_id,
             actor_type=actor_type,
             action=action,
             resource=resource,
             permissions_requested=permissions,
+            user_id=user_id,
+            task_id=task_id,
+            run_id=run_id,
+            step_node_id=step_node_id,
+            action_id=action_id,
         )
         decision = self.authorize(context)
         self.record_audit(context, decision)
+        decision.request_id = context.request_id
         return decision
 
     def allow_action(self, action: str) -> None:

@@ -46,6 +46,9 @@ from app.tasks.schemas import (
 from app.models.task import Task, TaskOutcome
 from app.models.execution_run import ExecutionRun, ExecutionRunStatus
 from services.security.audit_trail import AuditTrail
+from services.graph import events as graph_events
+from services.graph import schema as graph_schema
+from services.graph.provenance import ProvenanceError, resolve_run_provenance
 from app.tasks import service as task_service
 from app.models.task_event import EventType
 from services.intent.engine import get_intent_engine
@@ -2004,6 +2007,61 @@ async def _register_task_artifact(
         session.add(row)
         await session.commit()
         await session.refresh(row)
+
+        # ---- V3 Phase 1: the one VERIFIED event (spec §5.7) -------------
+        # Emitted only AFTER the artifact row is committed, so a verified
+        # claim can never exist without the row it corroborates. Best-effort:
+        # a recording failure never fails registration.
+        try:
+            if graph_events.events_enabled():
+                owner = (
+                    await session.execute(
+                        select(Task.user_id).where(Task.id == task_id)
+                    )
+                ).scalar_one_or_none()
+                if owner:
+                    scope = _os.path.join(
+                        workspace_root,
+                        "".join(c for c in str(task_id) if c.isalnum() or c == "-"),
+                    )
+                    try:
+                        rel = _os.path.relpath(resolved, scope).replace(_os.sep, "/")
+                    except ValueError:  # pragma: no cover - different drives
+                        rel = ""
+                    if rel.startswith(".."):
+                        rel = ""
+                    target = (
+                        graph_schema.resource_target(str(task_id), rel) if rel else None
+                    )
+                    await graph_events.emit(
+                        event_type=graph_schema.ARTIFACT_REGISTERED,
+                        outcome=graph_schema.EXECUTED,
+                        actor_id=PIPELINE_ACTOR,
+                        actor_type="service",
+                        user_id=str(owner),
+                        task_id=str(task_id),
+                        run_id=run_id or None,
+                        step_node_id=node_id,
+                        target_kind="resource" if target else None,
+                        target_id=target,
+                        evidence_class=graph_schema.VERIFIED,
+                        payload={
+                            "artifact_id": row.id,
+                            "sha256": digest,
+                            "size_bytes": size,
+                            "filename": _os.path.basename(resolved),
+                        },
+                    )
+        except ProvenanceError:
+            # An integrity fault is not silent: the caller records the
+            # registration failure path and the pipeline stays honest.
+            raise
+        except Exception as exc:  # noqa: BLE001 — never fail registration
+            logger.warning(
+                "artifact event not recorded task_id=%s error=%s",
+                task_id,
+                type(exc).__name__,
+            )
         return row
 
 
@@ -2180,6 +2238,8 @@ def _build_worker(
     graph=None,  # TaskGraph — lets delivery steps read dependency outputs
     step_params: dict | None = None,
     fail_spec: dict | None = None,
+    user_id: str = "",
+    execution_run_id: str = "",
 ):
     """Build the async worker for one graph node.
 
@@ -2228,6 +2288,9 @@ def _build_worker(
                     step_id=node_id,
                     resource=f"task:{task_id}/step:{node_id}",
                     workspace=workspace,
+                    # Trusted provenance from the run handle (never params).
+                    user_id=user_id,
+                    execution_run_id=execution_run_id,
                 ),
             )
             if result.permission_denied:
@@ -2528,6 +2591,16 @@ async def run_task_pipeline(
     await db.refresh(execution_run)
     run_id = execution_run.id
 
+    # ---- 0b. V3 Phase 1 provenance (one query per run, flag-gated) -----
+    # The handle is resolved and verified BEFORE any step runs, so no event is
+    # ever written with an unverified user. Flag-off keeps today's behaviour
+    # byte-for-byte (no extra query, no writes).
+    run_provenance = None
+    if graph_events.events_enabled():
+        run_provenance = await resolve_run_provenance(
+            db, task_id, run_id, actor_id=PIPELINE_ACTOR
+        )
+
     # Identifies THIS execute invocation in artifact history (reruns keep
     # their own rows; see _register_task_artifact for the semantics).
     # First-Class Execution Runs: this is now the real run's UUID — the
@@ -2633,6 +2706,8 @@ async def run_task_pipeline(
             actor_id=PIPELINE_ACTOR,
             task_id=task_id,
             workspace=TASK_WORKSPACE,
+            user_id=run_provenance.user_id if run_provenance else "",
+            execution_run_id=run_provenance.run_id if run_provenance else "",
             task_title=task.goal or task.title or "",
             decomposed=decomposed,
             graph=executor.graph,

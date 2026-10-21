@@ -34,6 +34,9 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
+from services.graph import events as graph_events
+from services.graph import schema as graph_schema
+from services.graph.provenance import ProvenanceError
 
 MAX_RESPONSE_BYTES = 2_000_000  # 2 MB
 MAX_REDIRECT_HOPS = 3
@@ -65,6 +68,85 @@ def _strip_tags(html: str) -> str:
 
 def _host_allowed(host: str, allowlist: set[str]) -> bool:
     return host.lower() in allowlist
+
+
+# --- V3 Phase 1 endpoint events (host + path only; never query/headers) ----
+
+def _linkage_kwargs(ctx: AdapterContext) -> dict:
+    return {
+        "user_id": getattr(ctx, "user_id", "") or None,
+        "task_id": getattr(ctx, "task_id", "") or None,
+        "run_id": getattr(ctx, "execution_run_id", "") or None,
+        "step_node_id": getattr(ctx, "step_id", "") or None,
+        "action_id": getattr(ctx, "action_id", "") or None,
+    }
+
+
+def _endpoint_parts(url: str) -> tuple[str | None, str | None]:
+    """Host and path template only — query strings can carry tokens."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None, None
+    host = (parts.hostname or "").lower() or None
+    path = parts.path or "/"
+    return host, path
+
+
+def _denial_reason(message: str | None) -> str:
+    text = (message or "").lower()
+    if "only https" in text:
+        return "scheme_not_https"
+    if "no hostname" in text:
+        return "missing_host"
+    if "userinfo" in text:
+        return "userinfo_present"
+    if "custom ports" in text:
+        return "port_not_default"
+    if "allowlist" in text:
+        return "host_not_allowlisted"
+    if "ip-literal" in text:
+        return "ip_literal"
+    if "non-public" in text or "ssrf" in text or "dns" in text:
+        return "non_public_address"
+    if "redirect" in text:
+        return "redirect_refused"
+    return "unknown"
+
+
+async def _record_endpoint(
+    ctx: AdapterContext,
+    *,
+    event_type: str,
+    outcome: str,
+    host: str | None,
+    path: str | None,
+    payload: dict,
+) -> None:
+    """Emit an endpoint event; recording never changes the outcome."""
+    if not getattr(ctx, "action_id", ""):
+        return
+    target = graph_schema.endpoint_target(host, path) if host and path else None
+    try:
+        await graph_events.emit(
+            event_type=event_type,
+            outcome=outcome,
+            actor_id=ctx.actor_id,
+            actor_type="service",
+            user_id=getattr(ctx, "user_id", "") or "",
+            task_id=getattr(ctx, "task_id", "") or "",
+            run_id=getattr(ctx, "execution_run_id", "") or None,
+            step_node_id=getattr(ctx, "step_id", "") or None,
+            tool_id="http_get",
+            action_id=ctx.action_id,
+            target_kind="endpoint" if target else None,
+            target_id=target,
+            payload=payload,
+        )
+    except ProvenanceError:
+        raise
+    except Exception:  # noqa: BLE001 - observation must not fail the action
+        return
 
 
 def _all_ips_global(host: str) -> tuple[bool, str]:
@@ -229,9 +311,53 @@ class HttpGetAdapter(ToolAdapter):
             url = params.get("url")
             if not url or not isinstance(url, str):
                 return _done(False, error="web_read requires a 'url' string parameter")
+            host, path_template = _endpoint_parts(url)
+            allowed, reason = self._check_url(url)
+            if not allowed:
+                # Refused before any byte: a denial, never an attempt.
+                await _record_endpoint(
+                    ctx,
+                    event_type=graph_schema.ENDPOINT_DENIED,
+                    outcome=graph_schema.DENIED,
+                    host=host,
+                    path=path_template,
+                    payload={
+                        **({"host": host} if host else {}),
+                        **({"path_template": path_template} if path_template else {}),
+                        "reason": _denial_reason(reason),
+                        "denial_layer": "adapter_policy",
+                    },
+                )
+                return _done(False, error=reason)
+            await _record_endpoint(
+                ctx,
+                event_type=graph_schema.ENDPOINT_ATTEMPTED,
+                outcome=graph_schema.ATTEMPTED,
+                host=host,
+                path=path_template,
+                payload={
+                    **({"host": host} if host else {}),
+                    **({"path_template": path_template} if path_template else {}),
+                },
+            )
             ok, error, status, text, hdrs = await self._fetch(url, headers)
             if not ok:
+                # Attempted but no verdict we can honestly record: the
+                # absence of a terminal event means "unknown" (spec §5.10).
                 return _done(False, error=error)
+            await _record_endpoint(
+                ctx,
+                event_type=graph_schema.ENDPOINT_SUCCEEDED,
+                outcome=graph_schema.EXECUTED,
+                host=host,
+                path=path_template,
+                payload={
+                    **({"host": host} if host else {}),
+                    **({"path_template": path_template} if path_template else {}),
+                    "status": status,
+                    "bytes": len(text),
+                },
+            )
             title_match = _TITLE_RE.search(text)
             return _done(
                 True,
@@ -256,9 +382,50 @@ class HttpGetAdapter(ToolAdapter):
                 f"&srsearch={quote(query, safe='')}"
                 f"&format=json&srlimit={limit}"
             )
+            api_host, api_path = _endpoint_parts(api_url)
+            api_allowed, api_reason = self._check_url(api_url)
+            if not api_allowed:
+                await _record_endpoint(
+                    ctx,
+                    event_type=graph_schema.ENDPOINT_DENIED,
+                    outcome=graph_schema.DENIED,
+                    host=api_host,
+                    path=api_path,
+                    payload={
+                        **({"host": api_host} if api_host else {}),
+                        **({"path_template": api_path} if api_path else {}),
+                        "reason": _denial_reason(api_reason),
+                        "denial_layer": "adapter_policy",
+                    },
+                )
+                return _done(False, error=f"web_search failed: {api_reason}")
+            await _record_endpoint(
+                ctx,
+                event_type=graph_schema.ENDPOINT_ATTEMPTED,
+                outcome=graph_schema.ATTEMPTED,
+                host=api_host,
+                path=api_path,
+                payload={
+                    **({"host": api_host} if api_host else {}),
+                    **({"path_template": api_path} if api_path else {}),
+                },
+            )
             ok, error, status, text, _hdrs = await self._fetch(api_url, headers)
             if not ok:
                 return _done(False, error=f"web_search failed: {error}")
+            await _record_endpoint(
+                ctx,
+                event_type=graph_schema.ENDPOINT_SUCCEEDED,
+                outcome=graph_schema.EXECUTED,
+                host=api_host,
+                path=api_path,
+                payload={
+                    **({"host": api_host} if api_host else {}),
+                    **({"path_template": api_path} if api_path else {}),
+                    "status": status,
+                    "bytes": len(text),
+                },
+            )
             try:
                 data = json.loads(text)
             except ValueError:

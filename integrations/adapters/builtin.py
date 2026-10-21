@@ -26,6 +26,9 @@ from services.execution.workspace_quota import (
     WorkspaceQuotaCache,
     WorkspaceQuotaExceeded,
 )
+from services.graph import events as graph_events
+from services.graph import schema as graph_schema
+from services.graph.provenance import ProvenanceError
 from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
 
@@ -46,6 +49,91 @@ def _task_scope(workspace: str, ctx: AdapterContext | None) -> str:
         if safe:
             return os.path.join(workspace, safe)
     return workspace
+
+
+def _linkage_kwargs(ctx: AdapterContext | None) -> dict[str, Any]:
+    """Audit linkage from the trusted context (None when absent)."""
+    return {
+        "user_id": getattr(ctx, "user_id", "") or None,
+        "task_id": getattr(ctx, "task_id", "") or None,
+        "run_id": getattr(ctx, "execution_run_id", "") or None,
+        "step_node_id": getattr(ctx, "step_id", "") or None,
+        "action_id": getattr(ctx, "action_id", "") or None,
+    }
+
+
+def _scope_relpath(path: str, workspace: str, ctx: AdapterContext | None) -> str | None:
+    """Path relative to THIS task's scope, or None when it escapes it.
+
+    Events store scope-relative paths only (design §9); absolute host paths
+    never enter the graph.
+    """
+    scope = _task_scope(workspace, ctx)
+    try:
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(scope))
+    except (TypeError, ValueError):
+        return None
+    if os.path.isabs(rel) or rel == ".." or rel.startswith(".." + os.sep):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+def _read_error_kind(error: str | None) -> str:
+    text = (error or "").lower()
+    if "not found" in text:
+        return "not_found"
+    if "too large" in text:
+        return "too_large"
+    if "access denied" in text:
+        return "permission"
+    if "decode" in text or "encoding" in text:
+        return "unreadable"
+    return "unknown"
+
+
+async def _record(
+    ctx: AdapterContext | None,
+    *,
+    tool_id: str,
+    event_type: str,
+    outcome: str,
+    payload: dict[str, Any] | None = None,
+    target_kind: str | None = None,
+    target_id: str | None = None,
+    evidence_class: str = graph_schema.OBSERVED,
+) -> None:
+    """Emit an adapter-level event; recording never changes the result.
+
+    Skipped entirely when the invocation has no registry-issued action id
+    (direct adapter use outside a gate) or no provenance, so existing callers
+    stay inert. ``emit`` itself counts/reports failures; only an identity
+    integrity fault propagates.
+    """
+    if ctx is None:
+        return
+    if not getattr(ctx, "action_id", ""):
+        return
+    try:
+        await graph_events.emit(
+            event_type=event_type,
+            outcome=outcome,
+            actor_id=ctx.actor_id,
+            actor_type="service",
+            user_id=getattr(ctx, "user_id", "") or "",
+            task_id=getattr(ctx, "task_id", "") or "",
+            run_id=getattr(ctx, "execution_run_id", "") or None,
+            step_node_id=getattr(ctx, "step_id", "") or None,
+            tool_id=tool_id,
+            action_id=ctx.action_id,
+            target_kind=target_kind,
+            target_id=target_id,
+            evidence_class=evidence_class,
+            payload=payload,
+        )
+    except ProvenanceError:
+        raise
+    except Exception:  # noqa: BLE001 - observation must not fail the action
+        return
 
 
 class _WorkspaceAdapter(ToolAdapter):
@@ -93,16 +181,70 @@ class FileReadAdapter(_WorkspaceAdapter):
             AuditTrail.instance().log(
                 actor_id=ctx.actor_id, action="tool:fs_read", resource=path,
                 allowed=False, details={"reason": "path outside workspace"},
+                **_linkage_kwargs(ctx),
+            )
+            await _record(
+                ctx,
+                tool_id=self.id,
+                event_type=graph_schema.RESOURCE_READ_DENIED,
+                outcome=graph_schema.DENIED,
+                payload={
+                    "reason": "outside_workspace",
+                    # A basename is the most a denial may reveal (no path).
+                    "requested_basename": os.path.basename(path)[:200] or None,
+                },
             )
             return AdapterResult(
                 success=False, tool_id=self.id,
                 error=f"Access denied: '{path}' is outside the workspace",
             )
+        encoding = params.get("encoding", "utf-8")
         result = await self._tool.execute({
             "path": clamped,
             "max_size": params.get("max_size", self._max_bytes),
-            "encoding": params.get("encoding", "utf-8"),
+            "encoding": encoding,
         })
+        rel = _scope_relpath(clamped, self.workspace, ctx)
+        task_id = getattr(ctx, "task_id", "") or ""
+        target = graph_schema.resource_target(task_id, rel) if rel else None
+        if result.success:
+            size = (result.output or {}).get("size") if isinstance(result.output, dict) else None
+            # The success entry is V3 evidence: with collection off the audit
+            # stream stays byte-identical to V2 (spec §3.1 T10), so existing
+            # audit counts and consumers are unaffected.
+            if graph_events.events_enabled():
+                AuditTrail.instance().log(
+                    actor_id=ctx.actor_id, action="tool:fs_read", resource=clamped,
+                    allowed=True, details={"reason": "read", "size": size},
+                    **_linkage_kwargs(ctx),
+                )
+            payload: dict[str, Any] = {"encoding": encoding}
+            if rel:
+                payload["relpath"] = rel
+            if size is not None:
+                payload["size"] = size
+            await _record(
+                ctx,
+                tool_id=self.id,
+                event_type=graph_schema.RESOURCE_READ_OBSERVED,
+                outcome=graph_schema.EXECUTED,
+                payload=payload,
+                target_kind="resource" if target else None,
+                target_id=target,
+            )
+        else:
+            await _record(
+                ctx,
+                tool_id=self.id,
+                event_type=graph_schema.RESOURCE_READ_OBSERVED,
+                outcome=graph_schema.FAILED,
+                payload={
+                    "error_kind": _read_error_kind(result.error),
+                    **({"relpath": rel} if rel else {}),
+                },
+                target_kind="resource" if target else None,
+                target_id=target,
+            )
         return AdapterResult(
             success=result.success,
             tool_id=self.id,
@@ -152,11 +294,24 @@ class FileWriteAdapter(_WorkspaceAdapter):
             return AdapterResult(
                 success=False, tool_id=self.id, error="Missing 'path' or 'content' parameter"
             )
+        payload_bytes = self._payload_bytes(content)
         clamped = self._clamp(path, ctx)
         if clamped is None:
             AuditTrail.instance().log(
                 actor_id=ctx.actor_id, action="tool:fs_write", resource=path,
                 allowed=False, details={"reason": "path outside workspace"},
+                **_linkage_kwargs(ctx),
+            )
+            await _record(
+                ctx,
+                tool_id=self.id,
+                event_type=graph_schema.RESOURCE_WRITE_DENIED,
+                outcome=graph_schema.DENIED,
+                payload={
+                    "reason": "outside_workspace",
+                    "bytes": payload_bytes,
+                    "quota_kind": None,
+                },
             )
             return AdapterResult(
                 success=False, tool_id=self.id,
@@ -164,7 +319,7 @@ class FileWriteAdapter(_WorkspaceAdapter):
             )
         enforcer = self._enforcers.for_scope(_task_scope(self.workspace, ctx))
         try:
-            with enforcer.reserve(clamped, self._payload_bytes(content)):
+            with enforcer.reserve(clamped, payload_bytes):
                 result = await self._tool.execute({
                     "path": clamped,
                     "content": content,
@@ -176,10 +331,55 @@ class FileWriteAdapter(_WorkspaceAdapter):
                 actor_id=ctx.actor_id, action="tool:fs_write", resource=path,
                 allowed=False,
                 details={"reason": "workspace quota", **exc.status()},
+                **_linkage_kwargs(ctx),
+            )
+            await _record(
+                ctx,
+                tool_id=self.id,
+                event_type=graph_schema.RESOURCE_WRITE_DENIED,
+                outcome=graph_schema.DENIED,
+                payload={
+                    "reason": "quota",
+                    "bytes": payload_bytes,
+                    "quota_kind": "workspace_quota",
+                },
             )
             return AdapterResult(
                 success=False, tool_id=self.id,
                 error=f"Workspace write refused: {exc}",
+            )
+
+        rel = _scope_relpath(clamped, self.workspace, ctx)
+        task_id = getattr(ctx, "task_id", "") or ""
+        target = graph_schema.resource_target(task_id, rel) if rel else None
+        if result.success:
+            out = result.output if isinstance(result.output, dict) else {}
+            size = out.get("size", payload_bytes)
+            # Same rule as fs_read: the extra success row exists only while
+            # V3 collection is enabled (D11), so flag-off behaviour — and
+            # every existing audit count — is unchanged.
+            if graph_events.events_enabled():
+                AuditTrail.instance().log(
+                    actor_id=ctx.actor_id, action="tool:fs_write", resource=clamped,
+                    allowed=True,
+                    details={"reason": "write", "size": size},
+                    **_linkage_kwargs(ctx),
+                )
+            committed: dict[str, Any] = {"bytes": payload_bytes}
+            if rel:
+                committed["relpath"] = rel
+            if "created" in out:
+                committed["created"] = bool(out.get("created"))
+            if "overwritten" in out:
+                committed["overwritten"] = bool(out.get("overwritten"))
+            await _record(
+                ctx,
+                tool_id=self.id,
+                event_type=graph_schema.RESOURCE_WRITE_COMMITTED,
+                outcome=graph_schema.EXECUTED,
+                payload=committed,
+                target_kind="resource" if target else None,
+                target_id=target,
             )
         return AdapterResult(
             success=result.success,

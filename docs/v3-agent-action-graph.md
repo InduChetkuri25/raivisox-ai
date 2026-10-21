@@ -815,6 +815,16 @@ strictly no weaker. "DoD" is the bar for merging.
   `attempted` + one terminal event; the V2 suite stays green.
 - **DoD:** events observable in a dev DB; flag off by default.
 
+**Status (2026-10-20): IMPLEMENTED — Phase 1 only.** Specification:
+`docs/v3-phase-1-spec.md`; results: `docs/v3-phase-1-acceptance.md`. What exists now:
+`services/graph/{schema,actions,provenance,events}.py`, `app/models/{graph_event,audit_link}.py`,
+`alembic/versions/003_graph_events_audit_links.py`, registry/adapter instrumentation, the
+`audit_links` side table, and 44 Phase 1 acceptance tests. `audit_events` is unchanged (no
+linkage columns); legacy rows read as `NULL` provenance and are never backfilled.
+`V3_EVENTS_ENABLED` remains **off by default**; production enablement is operational gate
+G1. Not implemented (Phase 2+): projection, graph store, blast radius, policy engine,
+approval flow, graph UI. PostgreSQL is designed for, not verified (no PG instance in CI).
+
 ### Phase 2 — Durable store and graph projection
 
 - **Files:** `services/graph/events.py` (append/query), `services/graph/projection.py`
@@ -941,7 +951,8 @@ strictly no weaker. "DoD" is the bar for merging.
 | Hardlink redirection and writes by running children can exceed the quota | **PARTIAL** — documented, inodes counted once, no interception | sandbox-design §5.1; `test_hardlinked_inode_is_counted_once` |
 | Container image toolchain not minimal (`python:3.12-slim` ships `pip`) | **PARTIAL** — digest pinned, toolchain still general | `services/execution/image_pins.py`; `APPROVED_IMAGES`; live gate |
 | Digest verification needs registry access; must fail closed offline | **PASS** for the documented behaviour — refusal, pull failure, and mismatch all fail closed; the explicit override is reported as `image_pinned: false` | `tests/unit/test_image_pins.py` (policy refusal, pull/inspect/mismatch, override flag) |
-| V3 itself | **NOT VERIFIED** — design only; no implementation, no tests | this document |
+| V3 Phase 1 (event schema + emission + audit linkage) | **VERIFIED locally** — 44 acceptance tests, SQLite migrations, flag-off inertness; **PostgreSQL unverified** | `docs/v3-phase-1-spec.md` §9; `docs/v3-phase-1-acceptance.md` |
+| V3 Phases 2–6 (projection, graph store, blast radius, policy, approval, UI) | **NOT IMPLEMENTED** — design only; no code, no tests | this document §13 |
 
 No concrete security **regression** was found while inspecting for this design. Two
 pre-existing **provenance** gaps were found and are recorded rather than fixed here:
@@ -1000,5 +1011,8 @@ This document was reviewed against the implementation at commit `9776497`; the c
 | Sandbox/quota/image controls as reported | `services/execution/*.py`, `tests/unit/test_sandbox_phase*.py`, `test_workspace_quota.py`, `test_image_pins.py` |
 | CI structure and current state | `.github/workflows/ci.yml`; run `39409267172` (`success`) |
 
-No V3 implementation exists: `git status` is clean and no `services/graph/` module, V3
-model, migration, API route, policy table, approval flow, or UI page is present.
+**Update (2026-10-20):** the paragraph above described the repository at design time and is
+kept as the design record. Phase 1 has since been implemented (`services/graph/`, the
+two new models, migration `003`, adapter instrumentation) and is reported in
+`docs/v3-phase-1-acceptance.md`. Still absent: projection/graph store, blast-radius
+engine, policy tables, approval flow, and any graph UI — i.e. Phases 2–6.

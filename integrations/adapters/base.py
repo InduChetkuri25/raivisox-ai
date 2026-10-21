@@ -22,6 +22,11 @@ class AdapterContext:
     resource: str = ""
     workspace: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    # V3 Phase 1 trusted provenance (set by the pipeline / registry; never
+    # from tool params). Defaults keep every existing construction site valid.
+    user_id: str = ""            # owning user (from tasks.user_id)
+    execution_run_id: str = ""   # execution_runs.id for this run
+    action_id: str = ""          # this invocation's id (registry-issued)
 
 
 @dataclass
