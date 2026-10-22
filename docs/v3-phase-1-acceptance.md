@@ -279,16 +279,16 @@ Linux CI (`ubuntu-latest`) for the same commit, from the run's logs:
 
 | Job / step | Result |
 |---|---|
-| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 51 skipped, 0 failed** (723 collected, 117 s) |
-| `backend-tests` — explicit `-m "not live_llm"` selection | 672 passed, 47 skipped, 4 deselected |
-| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **21 passed, 0 skipped** (the job fails on any skip) |
+| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 55 skipped, 0 failed** (727 collected, 123 s) |
+| `backend-tests` — explicit `-m "not live_llm"` selection | 672 passed, 51 skipped, 4 deselected |
+| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **25 passed, 0 skipped** (the job fails on any skip) |
 | `container-gate` — docker runtime proof | Docker `server=28.0.4 client=28.0.4`; digest-pinned image ran |
 | `container-gate` — live container tests (`-m live`) | **19 passed, 0 skipped** (a skip fails the gate) |
 | `container-gate` — non-live half | 64 passed, 3 skipped, 19 deselected |
 | `frontend-validation` — `tsc --noEmit` + `npm run build` | passed, build compiled successfully |
 
-CI and the Windows host now collect the same 723 items (`pytest -q` in CI,
-`pytest tests -q` locally). CI skips 51 and the host 70, because several
+CI and the Windows host now collect the same 727 items (`pytest -q` in CI,
+`pytest tests -q` locally). CI skips 55 and the host 74, because several
 sandbox/container tests are POSIX-only; no test that passes locally fails there.
 The SQLite backend job skips the twenty-three PostgreSQL-gated tests by design; the
 separate `postgres-gate` job runs them.
@@ -452,6 +452,20 @@ Nothing here is a human approval of those gates.
 
 ## 11. CI and delivery
 
+GitHub Actions run **39761493290** for commit `84cf4e6` (the `25P02` evidence) —
+**success**, all four jobs green: `Backend tests (pytest)` 672 passed / 55
+skipped / 0 failed (727 collected), and 672 passed / 51 skipped / 4 deselected
+for the explicit `-m "not live_llm"` selection; `PostgreSQL gate (real server)`
+**25 passed, 0 skipped** against a `postgres:16-alpine` service (the job fails
+on any skip), so `test_postgres_in_failed_transaction_is_not_transient`,
+`…_writer_does_not_retry_in_failed_transaction`,
+`…_aborted_session_is_not_reused` and
+`…_audit_flush_keeps_queue_after_in_failed_transaction` pass on the CI-pinned
+SQLAlchemy and driver too; `Container sandbox gate (live Docker)` Docker
+`server=28.0.4 client=28.0.4`, 19 live passed / 0 skipped plus 64 passed /
+3 skipped in the non-live half; `Frontend (typecheck + build)` typecheck clean
+and `Compiled successfully`.
+
 GitHub Actions run **39742438261** for commit `1cbe7ab` (the `55P03` lock-timeout
 evidence) — **success**, all four jobs green: `Backend tests (pytest)` 672
 passed / 51 skipped / 0 failed (723 collected); `PostgreSQL gate (real server)`
@@ -486,8 +500,10 @@ the non-live half), `Frontend (typecheck + build)`.
 - Implementation commits: `f30e6a4` (`feat(v3): record provenance-aware events
   and audit links behind a flag`), `5384608` (`test(v3): verify Phase 1
   against a real PostgreSQL server`), `9d1672b` (`fix(v3): retry PostgreSQL
-  concurrency conflicts by SQLSTATE`) and `1cbe7ab` (`test(v3): prove 55P03 lock
-  timeouts against a real PostgreSQL server`), all pushed to `origin/main`.
+  concurrency conflicts by SQLSTATE`), `1cbe7ab` (`test(v3): prove 55P03 lock
+  timeouts against a real PostgreSQL server`) and `84cf4e6` (`test(v3): prove
+  25P02 is refused, not retried, against real PostgreSQL`), all pushed to
+  `origin/main`.
 - `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
   started.
 - Working tree clean after the documentation commit that records this report.
