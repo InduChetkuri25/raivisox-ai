@@ -1,4 +1,4 @@
-"""V3 Phase 1 acceptance tests — the PostgreSQL path (T34b–T34h).
+"""V3 Phase 1 acceptance tests — the PostgreSQL path (T34b–T34s).
 
 T34 (`test_migration_003.py`) proves that migration 003 applies on a
 PostgreSQL URL. That is necessary but not sufficient: the writer, the audit
@@ -1043,3 +1043,314 @@ async def test_postgres_audit_flush_retry_cannot_duplicate(pg_stack, real_deadlo
         assert await AuditTrail.instance().flush_pending(session) == 0
     assert await count_rows(pg_stack, "audit_events") == 2
     assert await count_rows(pg_stack, "audit_links") == 1
+
+
+# ---------------------------------------------------------------------------
+# Lock-contention evidence — genuine 55P03 (lock_not_available)
+# ---------------------------------------------------------------------------
+
+
+class _TableLock:
+    """Hold an ACCESS EXCLUSIVE lock on ``table`` from an independent session.
+
+    This is the ordinary way a writer meets ``55P03``: a concurrent
+    DDL-shaped lock (``LOCK TABLE``, ``ALTER TABLE``, ``VACUUM FULL``) on the
+    table being written. Nothing is mocked — PostgreSQL blocks the writer's
+    own ``INSERT`` until that writer's ``lock_timeout`` cancels the statement
+    with ``lock_not_available``.
+    """
+
+    def __init__(self, url: str, table: str) -> None:
+        self._url = url
+        self._table = table
+        self._engine = None
+        self._conn = None
+        self._tx = None
+        self._held = False
+
+    async def __aenter__(self) -> "_TableLock":
+        self._engine = create_async_engine(self._url, poolclass=NullPool)
+        self._conn = await self._engine.connect()
+        self._tx = await self._conn.begin()
+        await self._conn.execute(
+            text(f"LOCK TABLE {self._table} IN ACCESS EXCLUSIVE MODE")
+        )
+        self._held = True
+        return self
+
+    async def release(self) -> None:
+        """End the holder's transaction, which releases the lock. Idempotent."""
+        if not self._held:
+            return
+        self._held = False
+        try:
+            await self._tx.rollback()
+        except Exception:  # pragma: no cover - already gone
+            pass
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.release()
+        if self._conn is not None:
+            try:
+                await self._conn.close()
+            except Exception:  # pragma: no cover - cleanup only
+                pass
+        if self._engine is not None:
+            await self._engine.dispose()
+
+
+def _lock_timeout_factory(url: str, milliseconds: int = 150):
+    """Session factory whose connections carry ``lock_timeout``.
+
+    The setting travels in the asyncpg startup packet, so it is the writer's
+    own session that asks PostgreSQL to give up after ``milliseconds`` instead
+    of waiting forever — the way a deployment would bound a lock wait. The
+    server, not the client, produces the resulting error.
+    """
+    engine = create_async_engine(
+        url,
+        poolclass=NullPool,
+        connect_args={"server_settings": {"lock_timeout": str(milliseconds)}},
+    )
+    return engine, async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def _capture_lock_not_available(url: str) -> DBAPIError:
+    """Provoke a real PostgreSQL lock timeout and return SQLSTATE ``55P03``.
+
+    One session holds ``ACCESS EXCLUSIVE`` on a probe table; the waiter sets
+    ``lock_timeout`` inside its own transaction and then asks for the same
+    lock. PostgreSQL itself cancels the waiter with ``canceling statement due
+    to lock timeout`` and SQLSTATE ``55P03``. The exception returned is the
+    one asyncpg raised through SQLAlchemy: this file synthesises no message
+    and attaches no SQLSTATE of its own.
+    """
+    engine = create_async_engine(url, poolclass=NullPool)
+    holder = waiter = None
+    error: DBAPIError | None = None
+    try:
+        async with engine.begin() as setup:
+            await setup.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS lock_probe "
+                    "(id integer PRIMARY KEY, v integer)"
+                )
+            )
+            await setup.execute(text("DELETE FROM lock_probe"))
+            await setup.execute(text("INSERT INTO lock_probe (id, v) VALUES (1, 0)"))
+
+        holder = await engine.connect()
+        waiter = await engine.connect()
+        tx_holder = await holder.begin()
+        tx_waiter = await waiter.begin()
+        await holder.execute(text("LOCK TABLE lock_probe IN ACCESS EXCLUSIVE MODE"))
+        # Set on the waiter's session, inside its transaction: the timer that
+        # fires is PostgreSQL's, so the cancellation is the server's own.
+        await waiter.execute(text("SET lock_timeout = '100ms'"))
+        try:
+            await waiter.execute(text("UPDATE lock_probe SET v = v + 1 WHERE id = 1"))
+        except DBAPIError as exc:
+            error = exc
+        for tx in (tx_waiter, tx_holder):
+            try:
+                await tx.rollback()
+            except Exception:  # pragma: no cover - an already-aborted transaction
+                pass
+    finally:
+        for conn in (waiter, holder):
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:  # pragma: no cover - cleanup only
+                    pass
+        await engine.dispose()
+
+    assert error is not None, "PostgreSQL did not raise a lock timeout for the waiter"
+    return error
+
+
+class _ReleaseOnError:
+    """Session proxy that clears the blocker as the first failure leaves.
+
+    The error the writer sees is the server's own ``55P03``; the proxy only
+    models contention that *ends* between attempts, which is the case a
+    bounded retry exists for. Without it the lock would outlive the writer's
+    budget and the retry could never be observed succeeding.
+    """
+
+    def __init__(self, session, release) -> None:
+        self._session = session
+        self._release = release
+
+    async def __aenter__(self):
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return await self._session.__aexit__(*exc_info)
+
+    def add(self, obj):
+        self._session.add(obj)
+
+    async def execute(self, *args, **kwargs):
+        return await self._session.execute(*args, **kwargs)
+
+    async def commit(self):
+        try:
+            return await self._session.commit()
+        except DBAPIError:
+            await self._release()
+            raise
+
+    async def rollback(self):
+        return await self._session.rollback()
+
+
+def _release_on_failure_factory(real_factory, release):
+    def _factory():
+        return _ReleaseOnError(real_factory(), release)
+
+    return _factory
+
+
+# ---------------------------------------------------------------------------
+# T34p — a real lock timeout is recognised as transient (SQLSTATE 55P03)
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_lock_timeout_is_classified_transient(migrated):
+    exc = await _capture_lock_not_available(migrated)
+    assert events._sqlstate(exc) == "55P03", (
+        f"driver did not expose the lock-not-available SQLSTATE: {exc!r}"
+    )
+    assert events._is_transient_lock(exc) is True
+    # Lock contention is not a missing table and must not disable recording.
+    assert events._is_missing_table(exc) is False
+
+
+# ---------------------------------------------------------------------------
+# T34q — persistent lock contention: bounded retries, then an honest failure
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_gives_up_after_real_lock_timeouts(pg_stack, migrated):
+    engine, factory = _lock_timeout_factory(migrated)
+    action_id = live_action()
+    try:
+        async with _TableLock(migrated, "graph_events"):
+            # Every attempt meets the real lock and PostgreSQL cancels all
+            # three with 55P03: the budget is bounded and the result is an
+            # honest failure, not a slow spin.
+            assert (
+                await emit_event(pg_stack, action_id=action_id, session_factory=factory)
+                is False
+            )
+        assert events.counters()["retries"] == 2, "two retries, three attempts in total"
+        assert events.counters()["failures"] == 1
+        assert await count_rows(pg_stack) == 0, "an aborted attempt leaves no row"
+
+        # The lock is gone: the identical fact commits exactly once, so the
+        # failed attempts left nothing behind to duplicate.
+        assert (
+            await emit_event(pg_stack, action_id=action_id, session_factory=factory)
+            is True
+        )
+        assert events.counters()["written"] == 1
+        assert events.counters()["duplicates"] == 0
+        assert await count_rows(pg_stack) == 1
+
+        # And the fact is still idempotent after the contention cleared.
+        assert (
+            await emit_event(pg_stack, action_id=action_id, session_factory=factory)
+            is True
+        )
+        assert events.counters()["duplicates"] == 1
+        assert await count_rows(pg_stack) == 1
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# T34r — the retry restarts the transaction and commits exactly once
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_retry_commits_once_when_the_lock_clears(
+    pg_stack, migrated
+):
+    engine, base_factory = _lock_timeout_factory(migrated)
+    lock = _TableLock(migrated, "graph_events")
+    action_id = live_action()
+    try:
+        async with lock:
+            factory = _release_on_failure_factory(base_factory, lock.release)
+            assert (
+                await emit_event(pg_stack, action_id=action_id, session_factory=factory)
+                is True
+            )
+        assert events.counters()["retries"] == 1, "one real 55P03, one fresh transaction"
+        assert events.counters()["written"] == 1
+        assert events.counters()["failures"] == 0
+        assert events.counters()["duplicates"] == 0
+
+        rows = await fetch_rows(pg_stack)
+        assert len(rows) == 1
+        assert rows[0]["action_id"] == action_id
+        assert await count_rows(pg_stack) == 1, "a restart commits once, never twice"
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# T34s — a real lock timeout cannot acknowledge or duplicate audit rows
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_audit_flush_survives_a_real_lock_timeout(pg_stack, migrated):
+    AuditTrail.instance().log(
+        actor_id="pipeline-service",
+        action="tool:fs_write",
+        resource="x",
+        allowed=True,
+        user_id=pg_stack.user_id,
+        task_id=pg_stack.task_id,
+        run_id=pg_stack.run_id,
+        step_node_id="step-1",
+        action_id=str(uuid.uuid4()),
+    )
+    AuditTrail.instance().log(
+        actor_id="legacy-actor", action="api:view_audit", resource="audit", allowed=True
+    )
+    assert AuditTrail.instance().pending_count() == 2
+
+    engine, factory = _lock_timeout_factory(migrated)
+    try:
+        # The link table is what the flush needs last: the audit row is already
+        # staged when the link INSERT blocks, so the timeout proves atomicity
+        # rather than an early read failure.
+        async with _TableLock(migrated, "audit_links"):
+            async with factory() as session:
+                with pytest.raises(DBAPIError) as raised:
+                    await AuditTrail.instance().flush_pending(session)
+        assert events._sqlstate(raised.value) == "55P03"
+        assert events._is_transient_lock(raised.value) is True
+
+        # Nothing was acknowledged and nothing was persisted: the audit row and
+        # its link rolled back together, so no orphan link exists either.
+        assert AuditTrail.instance().pending_count() == 2
+        assert await count_rows(pg_stack, "audit_events") == 0
+        assert await count_rows(pg_stack, "audit_links") == 0
+
+        async with factory() as session:
+            assert await AuditTrail.instance().flush_pending(session) == 2
+        assert AuditTrail.instance().pending_count() == 0
+        assert await count_rows(pg_stack, "audit_events") == 2
+        assert await count_rows(pg_stack, "audit_links") == 1
+
+        # A further flush is a no-op: no duplicate audit rows or links.
+        async with factory() as session:
+            assert await AuditTrail.instance().flush_pending(session) == 0
+        assert await count_rows(pg_stack, "audit_events") == 2
+        assert await count_rows(pg_stack, "audit_links") == 1
+    finally:
+        await engine.dispose()

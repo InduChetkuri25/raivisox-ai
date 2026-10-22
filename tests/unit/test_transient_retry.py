@@ -11,8 +11,9 @@ Two questions are kept apart on purpose:
    swallowed cancellation, and the final error propagated to the caller.
 
 These tests need no server: they pin the policy. The real PostgreSQL server is
-exercised in ``test_postgres_phase1.py`` (T34j–T34n), including genuine
-deadlocks and serialization failures.
+exercised in ``test_postgres_phase1.py`` (T34j–T34s), including genuine
+deadlocks, serialization failures and a genuine ``55P03`` produced by a real
+``lock_timeout``.
 """
 
 from __future__ import annotations

@@ -861,9 +861,11 @@ flusher is different on purpose: `AuditTrail.flush_pending` re-raises its final 
 leaves the events queued for the next flush.
 
 Tests: `tests/unit/test_transient_retry.py` (classification table, bounded retries,
-propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34o` prove the
-same policy against a real PostgreSQL server, including a genuine deadlock (`40P01`) and a
-genuine SERIALIZABLE conflict (`40001`) produced by the server itself.
+propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34s` prove the
+same policy against a real PostgreSQL server, with every SQLSTATE produced by the server
+itself: a genuine deadlock (`40P01`), a genuine SERIALIZABLE conflict (`40001`) and a
+genuine `55P03` (`lock_not_available`) raised when a `lock_timeout` on the writer's own
+session expires against a concurrent `ACCESS EXCLUSIVE` lock.
 
 ### 8.3 No partial events
 
@@ -957,6 +959,10 @@ marked *existing*).
 | T34m | `test_postgres_phase1.py::test_postgres_writer_gives_up_after_bounded_retries` | every attempt fails with `40P01` | `emit()` | `False`, 2 retries, 1 failure, 0 rows; recording is not disabled and a later emit succeeds | bounded, and a failure is not a reason to stop observing |
 | T34n | `test_postgres_phase1.py::test_postgres_writer_does_not_retry_permanent_error` | `payload_hash` column narrowed so the insert fails with `22001` | `emit()` | `False`, **0 retries**, 1 failure, 0 rows | a permanent server error is not treated as contention |
 | T34o | `test_postgres_phase1.py::test_postgres_audit_flush_retry_cannot_duplicate` | a real `40P01` at the flush commit | `flush_pending` twice | first attempt persists nothing and keeps both events queued; the retry writes 2 audit rows + 1 link exactly once; a third flush writes 0 | a transient failure cannot acknowledge or duplicate audit evidence |
+| T34p | `test_postgres_phase1.py::test_postgres_lock_timeout_is_classified_transient` | `ACCESS EXCLUSIVE` held on a probe table by an independent session; the waiter sets `lock_timeout` and then asks for the same lock | lock + update | the server cancels the waiter with SQLSTATE `55P03` (`canceling statement due to lock timeout`); `_sqlstate` returns it, the classifier returns transient, and it is not mistaken for a missing table | `lock_not_available` is proven by the server, not by a synthesised message |
+| T34q | `test_postgres_phase1.py::test_postgres_writer_gives_up_after_real_lock_timeouts` | `ACCESS EXCLUSIVE` held on `graph_events`; the writer's connections carry `lock_timeout` | `emit()` | every attempt meets the real lock: `False`, 2 retries, 1 failure, 0 rows; after release the same action writes exactly once and a second emit is a duplicate; recording stays enabled | persistent lock contention is bounded, leaves nothing behind, and cannot duplicate |
+| T34r | `test_postgres_phase1.py::test_postgres_writer_retry_commits_once_when_the_lock_clears` | the same real lock, cleared as the first `55P03` propagates | `emit()` | 1 retry, 1 row written, 0 failures, 0 duplicates | a retry restarts the transaction and commits exactly once |
+| T34s | `test_postgres_phase1.py::test_postgres_audit_flush_survives_a_real_lock_timeout` | `ACCESS EXCLUSIVE` on `audit_links`, so the *link* insert is what blocks | `flush_pending` twice | the real `55P03` persists nothing and keeps both events queued; no orphan audit row and no orphan link; the retry writes 2 audit rows + 1 link; a third flush writes 0 | lock contention cannot acknowledge or duplicate audit evidence |
 | T37 | `tests/unit/test_transient_retry.py` (34 tests, no server needed) | fake driver errors carrying `sqlstate`/`pgcode`, and a flaky session factory over real SQLite | classify + `emit()` | `40P01`/`40001`/`40000`/`55P03` transient; `23505`/`23503`/`42501`/`42P01`/`25P02`/`08xxx`/`28P01`/`57014` not; SQLite lock text still transient; bounded attempts; final error propagated to the caller; `CancelledError` not swallowed; duplicate still a duplicate | the policy is pinned on every host, including the classification table PG cannot enumerate cheaply |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | unchanged | run | still passes (zero drift) | model and migration cannot diverge |
 | T36 | Existing suites (`tests/unit/*`, live container gate) | unchanged | run | all previously passing tests still pass; counts unchanged | no regression to authorization, sandbox, quotas, digest pinning |
