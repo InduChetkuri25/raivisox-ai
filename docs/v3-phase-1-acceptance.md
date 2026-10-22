@@ -20,7 +20,7 @@ or graph UI exists in this change.
 | Failure semantics (flag-off, missing table, write error) | **PASS** |
 | Retry / rollback / restart persistence | **PASS** |
 | Legacy audit compatibility (`audit_events` untouched) | **PASS** |
-| PostgreSQL migration, events, audit links (T34, T34b–T34i) | **PASS** — real PostgreSQL 16.9; see §7 |
+| PostgreSQL migration, events, audit links, retries (T34, T34b–T34s) | **PASS** — real PostgreSQL 16.2/16.9; see §7 |
 | Live Linux container gate | **CI only** — no Docker/WSL on the dev host; see §7 |
 | Flag default | `V3_EVENTS_ENABLED` **off**, unchanged |
 
@@ -273,18 +273,19 @@ Linux CI (`ubuntu-latest`) for the same commit, from the run's logs:
 
 | Job / step | Result |
 |---|---|
-| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 47 skipped, 0 failed** (719 collected, 121 s) |
-| `backend-tests` — explicit `-m "not live_llm"` selection | 638 passed, 37 skipped, 4 deselected |
-| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **17 passed, 0 skipped** (the job fails on any skip) |
+| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 51 skipped, 0 failed** (723 collected, 117 s) |
+| `backend-tests` — explicit `-m "not live_llm"` selection | 672 passed, 47 skipped, 4 deselected |
+| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **21 passed, 0 skipped** (the job fails on any skip) |
 | `container-gate` — docker runtime proof | Docker `server=28.0.4 client=28.0.4`; digest-pinned image ran |
 | `container-gate` — live container tests (`-m live`) | **19 passed, 0 skipped** (a skip fails the gate) |
 | `container-gate` — non-live half | 64 passed, 3 skipped, 19 deselected |
 | `frontend-validation` — `tsc --noEmit` + `npm run build` | passed, build compiled successfully |
 
-The Linux job collects 4 more items than the Windows host (719 vs 715) and skips
-fewer (47 vs 62), because several sandbox/container tests are POSIX-only; no
-test that passes locally fails there. The SQLite backend job skips the nineteen
-PostgreSQL-gated tests by design; the separate `postgres-gate` job runs them.
+CI and the Windows host now collect the same 723 items (`pytest -q` in CI,
+`pytest tests -q` locally). CI skips 51 and the host 70, because several
+sandbox/container tests are POSIX-only; no test that passes locally fails there.
+The SQLite backend job skips the nineteen PostgreSQL-gated tests by design; the
+separate `postgres-gate` job runs them.
 
 ## 7. Container gate and PostgreSQL
 
@@ -363,12 +364,12 @@ PostgreSQL-gated tests by design; the separate `postgres-gate` job runs them.
     python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q
   ```
 
-  Without the variable, all nine PostgreSQL-gated tests skip with an explicit
-  reason and the report says PostgreSQL is unverified — a skip is never a pass.
-  The CI workflow now runs this same gate against a `postgres:16-alpine` service
-  in the `postgres-gate` job (result in §11); that job fails if any of the nine
-  tests skips, so a future PG regression cannot pass CI silently (R11). Nothing
-  in the suite claims a PG guarantee from SQLite evidence.
+  Without the variable, all nineteen PostgreSQL-gated tests skip with an
+  explicit reason and the report says PostgreSQL is unverified — a skip is never
+  a pass. The CI workflow runs this same gate against a `postgres:16-alpine`
+  service in the `postgres-gate` job (result in §11); that job fails if any of
+  the 21 gate tests skips, so a future PG regression cannot pass CI silently
+  (R11). Nothing in the suite claims a PG guarantee from SQLite evidence.
 - **Driver.** T34 previously inspected the migrated schema through
   `postgresql+psycopg2`, but `psycopg2` is not a declared dependency of this
   project (only `asyncpg` is). It now inspects with asyncpg — the assertions are
@@ -403,12 +404,18 @@ Nothing here is a human approval of those gates.
 
 ## 10. Limits and rollback
 
-- PostgreSQL is verified on 16.9 by the opt-in run above and by the CI
-  `postgres-gate` job (§11), but only on that major version: no multi-version
-  matrix was run, and the concurrency evidence (`40P01`, `40001`) comes from
-  deliberately provoked single deadlock/serialization scenarios, not from a
-  sustained contention benchmark. SQLite remains the dialect every other test
-  uses.
+- PostgreSQL is verified on 16.9 (earlier run) and 16.2 (the `55P03`
+  evidence) by the opt-in runs above and by the CI `postgres-gate` job (§11),
+  but only on that major version: no multi-version matrix was run, and the
+  concurrency evidence (`40P01`, `40001`, `55P03`) comes from deliberately
+  provoked single deadlock / serialization / lock-timeout scenarios, not from a
+  sustained contention benchmark. `25P02` ("current transaction is aborted") is
+  deliberately *not* classified as transient: it is the effect of an earlier
+  abort, and the classifier is only ever handed the original error because each
+  retry opens a new transaction. `55P03` is provoked through `lock_timeout`; a
+  plain unbounded wait would hang rather than error, which is why the tests set
+  the timeout the way a deployment would. SQLite remains the dialect every
+  other test uses.
 - Child-process I/O, header/body contents, resolved IPs, clock skew: out of
   scope by design and not claimed.
 - Rollback is `alembic downgrade 002`, which drops the two new tables and
@@ -418,6 +425,18 @@ Nothing here is a human approval of those gates.
   started.
 
 ## 11. CI and delivery
+
+GitHub Actions run **39742438261** for commit `1cbe7ab` (the `55P03` lock-timeout
+evidence) — **success**, all four jobs green: `Backend tests (pytest)` 672
+passed / 51 skipped / 0 failed (723 collected); `PostgreSQL gate (real server)`
+**21 passed, 0 skipped** against a `postgres:16-alpine` service (the job fails
+on any skip), so `test_postgres_lock_timeout_is_classified_transient`,
+`…_gives_up_after_real_lock_timeouts`, `…_retry_commits_once_when_the_lock_clears`
+and `…_audit_flush_survives_a_real_lock_timeout` all pass on the CI-pinned
+SQLAlchemy and driver too; `Container sandbox gate (live Docker)` Docker
+`server=28.0.4 client=28.0.4`, 19 live passed / 0 skipped plus 64 passed /
+3 skipped in the non-live half; `Frontend (typecheck + build)` typecheck clean
+and `Compiled successfully`.
 
 GitHub Actions run **39590736377** for commit `9d1672b` (the retry hardening) —
 **success**, all four jobs green: `Backend tests (pytest)` 672 passed / 47
@@ -440,9 +459,11 @@ the non-live half), `Frontend (typecheck + build)`.
 
 - Implementation commits: `f30e6a4` (`feat(v3): record provenance-aware events
   and audit links behind a flag`), `5384608` (`test(v3): verify Phase 1
-  against a real PostgreSQL server`) and `9d1672b` (`fix(v3): retry PostgreSQL
-  concurrency conflicts by SQLSTATE`), all pushed to `origin/main`.
-- `v1.0.0` untouched; no release tag created.
+  against a real PostgreSQL server`), `9d1672b` (`fix(v3): retry PostgreSQL
+  concurrency conflicts by SQLSTATE`) and `1cbe7ab` (`test(v3): prove 55P03 lock
+  timeouts against a real PostgreSQL server`), all pushed to `origin/main`.
+- `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
+  started.
 - Working tree clean after the documentation commit that records this report.
 
 ## 12. Verdict
