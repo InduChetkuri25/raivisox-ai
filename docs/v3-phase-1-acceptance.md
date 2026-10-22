@@ -20,7 +20,7 @@ or graph UI exists in this change.
 | Failure semantics (flag-off, missing table, write error) | **PASS** |
 | Retry / rollback / restart persistence | **PASS** |
 | Legacy audit compatibility (`audit_events` untouched) | **PASS** |
-| PostgreSQL migration, events, audit links, retries (T34, T34b–T34s) | **PASS** — real PostgreSQL 16.2/16.9; see §7 |
+| PostgreSQL migration, events, audit links, retries (T34, T34b–T34w) | **PASS** — real PostgreSQL 16.2/16.9; see §7 |
 | Live Linux container gate | **CI only** — no Docker/WSL on the dev host; see §7 |
 | Flag default | `V3_EVENTS_ENABLED` **off**, unchanged |
 
@@ -223,6 +223,10 @@ per-file evidence in §6.
 | T34q | `test_postgres_phase1.py::test_postgres_writer_gives_up_after_real_lock_timeouts` | PASS — the writer meets a real lock on `graph_events` three times: 2 retries, 1 failure, 0 rows; after release the same action writes exactly once and re-emits as a duplicate |
 | T34r | `test_postgres_phase1.py::test_postgres_writer_retry_commits_once_when_the_lock_clears` | PASS — one real `55P03`, one fresh transaction, one row, no failure, no duplicate |
 | T34s | `test_postgres_phase1.py::test_postgres_audit_flush_survives_a_real_lock_timeout` | PASS — a real `55P03` on the link insert persists neither the audit row nor its link and keeps both events queued; the retry writes 2 audit rows + 1 link once; a third flush writes 0 |
+| T34t | `test_postgres_phase1.py::test_postgres_in_failed_transaction_is_not_transient` | PASS — a real `23505` aborts the transaction and the next statement returns `25P02`; both are non-transient, and the abort effect is not read as a missing table |
+| T34u | `test_postgres_phase1.py::test_postgres_writer_does_not_retry_in_failed_transaction` | PASS — the real `25P02` at commit gives 0 retries, 1 failure, 0 rows; recording stays enabled and the next emit succeeds |
+| T34v | `test_postgres_phase1.py::test_postgres_aborted_session_is_not_reused` | PASS — a real `22012` leaves the session's transaction dead (`25P02` on the next statement); a fresh session from the same factory is clean and emits one row with 0 retries |
+| T34w | `test_postgres_phase1.py::test_postgres_audit_flush_keeps_queue_after_in_failed_transaction` | PASS — the real `25P02` at the flush commit persists nothing and keeps both events queued; a clean flush writes 2 audit rows + 1 link once; a third flush writes 0 |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | PASS |
 | T36 | Existing suites (`tests/unit/**`) | PASS — see §6 |
 | T37 | `test_transient_retry.py` (34 tests) | PASS — SQLSTATE classification table, SQLite lock text, bounded retries, final-error propagation, cancellation, dedupe after retry, missing-table disable |
@@ -233,10 +237,11 @@ per-file evidence in §6.
 **78 passed, 1 skipped, 0 failed** across the Phase 1 acceptance files plus
 `test_transient_retry.py` without a PostgreSQL URL. With
 `RAIVISOX_TEST_POSTGRES_URL` set the same selection plus
-`test_postgres_phase1.py` is **97 passed, 0 skipped, 0 failed** — the nineteen
-PostgreSQL-gated tests (T34, T34b–T34s) run instead of skipping, and
-T34j–T34s add the concurrency evidence: real deadlocks (`40P01`), real
-serialization failures (`40001`) and a real lock timeout (`55P03`).
+`test_postgres_phase1.py` is **101 passed, 0 skipped, 0 failed** — the
+twenty-three PostgreSQL-gated tests (T34, T34b–T34w) run instead of skipping,
+and T34j–T34w add the concurrency evidence: real deadlocks (`40P01`), real
+serialization failures (`40001`), a real lock timeout (`55P03`) and a real
+aborted-transaction error (`25P02`) that is refused rather than retried.
 
 ## 6. Verification runs
 
@@ -246,19 +251,20 @@ pytest 9.1.1):
 | Run | Command | Result |
 |---|---|---|
 | Phase 1 focused | `python -m pytest tests/unit/test_graph_events.py tests/unit/test_transient_retry.py tests/unit/test_provenance.py tests/unit/test_audit_linkage.py tests/unit/test_fs_read_instrumentation.py tests/unit/test_endpoint_instrumentation.py tests/unit/test_workspace_quota_integration.py tests/unit/test_artifact_events.py tests/unit/test_migration_003.py -q` | **78 passed, 1 skipped, 0 failed** |
-| Phase 1 focused, with PostgreSQL | same selection plus `tests/unit/test_postgres_phase1.py`, `RAIVISOX_TEST_POSTGRES_URL` set | **97 passed, 0 skipped, 0 failed** |
-| PostgreSQL migration + PG gate | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q` | **21 passed, 0 skipped** |
-| Full backend | `python -m pytest tests/unit -q` | **653 passed, 66 skipped, 0 failed** (719 collected, 486 s; see §7 for the PG run) |
-| Full backend, with PostgreSQL | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests/unit -q` | **672 passed, 47 skipped, 0 failed** (719 collected, 605 s) |
-| Full backend, every test directory | `python -m pytest tests -q` | **653 passed, 70 skipped, 0 failed** (723 collected, 388 s) |
+| Focused transient-retry tests | `python -m pytest tests/unit/test_transient_retry.py -q` | **34 passed, 0 failed** |
+| Phase 1 focused, with PostgreSQL | same selection plus `tests/unit/test_postgres_phase1.py`, `RAIVISOX_TEST_POSTGRES_URL` set | **101 passed, 0 skipped, 0 failed** |
+| PostgreSQL migration + PG gate | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q` | **25 passed, 0 skipped** |
+| Full backend | `python -m pytest tests/unit -q` | **653 passed, 70 skipped, 0 failed** (723 collected, 467 s; see §7 for the PG run) |
+| Full backend, with PostgreSQL | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests/unit -q` | **676 passed, 47 skipped, 0 failed** (723 collected) |
+| Full backend, every test directory | `python -m pytest tests -q` | **653 passed, 74 skipped, 0 failed** (727 collected, 592 s) |
 | Container gate, non-live half | `python -m pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py -m "not live" -q` | 62 passed, 5 skipped, 19 deselected |
 | Frontend typecheck | `cd apps/web && npx tsc --noEmit` | exit 0, no diagnostics |
 | Frontend production build | `cd apps/web && npm run build` (`next build`, Next 15.1.6) | exit 0, 6 routes generated |
 | Full backend (baseline, pre-change, for comparison) | same suite at `014fcd6` | 618 passed, 49 skipped |
 
 Skips are pre-existing environment skips (Windows-only variants, no Ollama, no
-Docker) plus the nineteen PostgreSQL-gated tests (T34, T34b–T34s) when no PG URL
-is supplied. The PostgreSQL run that executes them is in §7.
+Docker) plus the twenty-three PostgreSQL-gated tests (T34, T34b–T34w) when no PG
+URL is supplied. The PostgreSQL run that executes them is in §7.
 
 One pre-existing flake was seen and is reported rather than hidden:
 `test_llm_dod.py::test_recovery_regenerates_wrong_llm_module` failed once
@@ -284,7 +290,7 @@ Linux CI (`ubuntu-latest`) for the same commit, from the run's logs:
 CI and the Windows host now collect the same 723 items (`pytest -q` in CI,
 `pytest tests -q` locally). CI skips 51 and the host 70, because several
 sandbox/container tests are POSIX-only; no test that passes locally fails there.
-The SQLite backend job skips the nineteen PostgreSQL-gated tests by design; the
+The SQLite backend job skips the twenty-three PostgreSQL-gated tests by design; the
 separate `postgres-gate` job runs them.
 
 ## 7. Container gate and PostgreSQL
@@ -297,8 +303,9 @@ separate `postgres-gate` job runs them.
   on any skip), 64 passed / 3 skipped in the non-live half. This is the
   authoritative Linux container evidence.
 - **PostgreSQL (verified).** The PostgreSQL path was verified against a real
-  server. The lock-contention evidence below (T34p–T34s) was produced on
-  PostgreSQL **16.2**; the earlier Phase 1 run (T34b–T34o) used **16.9**. Both
+  server. The lock-contention and aborted-transaction evidence below
+  (T34p–T34w) was produced on PostgreSQL **16.2**; the earlier Phase 1 run
+  (T34b–T34o) used **16.9**. Both
   are the same major version as the `postgres:16-alpine` service the compose
   files ship. Each instance was a throwaway cluster reachable only on
   `127.0.0.1` with trust auth scoped to that loopback address; no credential was
@@ -308,10 +315,10 @@ separate `postgres-gate` job runs them.
   | Run | Result |
   |---|---|
   | `test_migration_003.py` (T32–T34) with the PG URL | **3 passed, 0 skipped** |
-  | `test_postgres_phase1.py` (T34b–T34s) | **18 passed, 0 skipped** (16.2; 14 of them already on 16.9) |
-  | Phase 1 focused suite with the PG URL (§5) | **97 passed, 0 skipped** |
-  | Full backend suite without the PG URL (§6) | **653 passed, 66 skipped, 0 failed** |
-  | Full backend suite with the PG URL (§6) | **672 passed, 47 skipped, 0 failed** |
+  | `test_postgres_phase1.py` (T34b–T34w) | **22 passed, 0 skipped** (16.2; 14 of them already on 16.9) |
+  | Phase 1 focused suite with the PG URL (§5) | **101 passed, 0 skipped** |
+  | Full backend suite without the PG URL (§6) | **653 passed, 70 skipped, 0 failed** |
+  | Full backend suite with the PG URL (§6) | **676 passed, 47 skipped, 0 failed** |
   | CI `postgres-gate` (§11) | reported in §11 for the current commit |
   What the PostgreSQL run proves, in the server's own terms: migration `003`
   creates both tables with their unique keys, all nine indexes, both
@@ -328,7 +335,7 @@ separate `postgres-gate` job runs them.
   the audit row and its link.
 
   The same run now also pins the retry policy against the server itself
-  (T34j–T34s): a deliberately provoked deadlock arrives as SQLSTATE `40P01` and
+  (T34j–T34w): a deliberately provoked deadlock arrives as SQLSTATE `40P01` and
   a deliberately provoked SERIALIZABLE conflict as `40001`, both classified
   transient; a server-raised `40P01` on the first write attempt is retried and
   commits exactly one row; a persistently failing write stops after three
@@ -354,6 +361,24 @@ separate `postgres-gate` job runs them.
   leaves 0 audit rows, 0 links and both events still queued, and the retry
   writes 2 audit rows + 1 link exactly once.
 
+  `25P02` is the mirror case: a SQLSTATE that *is* real but must never be
+  retried, because it reports an earlier failure instead of causing one. A
+  genuine unique-constraint violation (`23505`) aborts a real transaction, and
+  the next statement in it is answered by the server with
+  `asyncpg.exceptions.InFailedSQLTransactionError`, `sqlstate = 25P02`,
+  `message = current transaction is aborted, commands ignored until end of
+  transaction block`. The classifier returns false for both the cause and the
+  effect (T34t), so a retry can neither mask the constraint that failed nor
+  spin on a dead transaction. Driving that real `25P02` through the writer gives
+  0 retries, 1 counted failure and 0 rows, with recording still enabled (T34u).
+  T34v shows the mechanism the writer relies on: a session whose transaction a
+  real `22012` aborted answers `25P02` if it is reused, while a fresh session
+  from the same factory is clean and emits normally — the writer opens a session
+  per attempt, so it never sends a second statement into an aborted
+  transaction. At the audit flush the same error persists nothing, keeps both
+  events queued, and a clean flush writes 2 audit rows + 1 link exactly once
+  (T34w).
+
   Reproduce (PostgreSQL 13+, role needs `CREATEDB`: the tests create and drop
   their own throwaway databases; T34 additionally migrates the database named in
   the URL):
@@ -364,11 +389,11 @@ separate `postgres-gate` job runs them.
     python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q
   ```
 
-  Without the variable, all nineteen PostgreSQL-gated tests skip with an
+  Without the variable, all twenty-three PostgreSQL-gated tests skip with an
   explicit reason and the report says PostgreSQL is unverified — a skip is never
   a pass. The CI workflow runs this same gate against a `postgres:16-alpine`
   service in the `postgres-gate` job (result in §11); that job fails if any of
-  the 21 gate tests skips, so a future PG regression cannot pass CI silently
+  the 25 gate tests skips, so a future PG regression cannot pass CI silently
   (R11). Nothing in the suite claims a PG guarantee from SQLite evidence.
 - **Driver.** T34 previously inspected the migrated schema through
   `postgresql+psycopg2`, but `psycopg2` is not a declared dependency of this
@@ -383,8 +408,8 @@ separate `postgres-gate` job runs them.
 | Provenance spoofing | Closed. Identity comes from `tasks.user_id` + an `execution_runs` row of the same task, verified per event; `action_id` must be live in the process registry; params are ignored (T13–T17). |
 | Cross-user leakage | Closed by the same checks: events and links cannot name another user's task or run; scope-relative paths only; `target_id` is `"res:<task>/<rel>"`. |
 | Secrets/content in events | Payload allowlists, secret-shaped-value refusal, 8 KiB cap, no headers/query strings/body, no file content (T4, T5, T22, T24, T27). |
-| Transaction boundaries | Audit row + link commit together, dequeue after commit (T18b, T34o, T34s); each event is its own short transaction; no partial event exists (all fields validated before the insert); a retry always restarts the transaction rather than continuing an aborted one (T34j–T34m, T34q–T34r). |
-| Retry surface | Only concurrency conflicts are retried (`40P01`/`40001`/`55P03`, SQLite lock text), each proven against a real server (T34j, T34k, T34p). Constraint, authorization, missing-table, connection and configuration errors are not retried (T34n, T37), so a retry cannot mask a permanent failure or replay a rejected write. |
+| Transaction boundaries | Audit row + link commit together, dequeue after commit (T18b, T34o, T34s, T34w); each event is its own short transaction; no partial event exists (all fields validated before the insert); a retry always restarts the transaction rather than continuing an aborted one (T34j–T34m, T34q–T34r), and a session whose transaction the server aborted is never reused (T34v). |
+| Retry surface | Only concurrency conflicts are retried (`40P01`/`40001`/`55P03`, SQLite lock text), each proven against a real server (T34j, T34k, T34p). Constraint, authorization, missing-table, connection and configuration errors are not retried (T34n, T37), and neither is the server's own `25P02` abort effect (T34t–T34u), so a retry cannot mask a permanent failure or replay a rejected write. |
 | Migration compatibility | Additive only; `audit_events` untouched (T19b); upgrade → downgrade → upgrade round-trips (T32); pre-existing rows preserved (T33); zero-drift test passes (T35). |
 | Unsafe execution paths | None added. No new shell usage, no unsandboxed fallback, no adapter body change beyond wrappers. |
 | Sandbox/quota controls | Unchanged control flow; quota denial now also emits an event and is exercised against the real enforcer (T28, T29). |
@@ -404,15 +429,16 @@ Nothing here is a human approval of those gates.
 
 ## 10. Limits and rollback
 
-- PostgreSQL is verified on 16.9 (earlier run) and 16.2 (the `55P03`
-  evidence) by the opt-in runs above and by the CI `postgres-gate` job (§11),
-  but only on that major version: no multi-version matrix was run, and the
+- PostgreSQL is verified on 16.9 (earlier run) and 16.2 (the `55P03` and
+  `25P02` evidence) by the opt-in runs above and by the CI `postgres-gate` job
+  (§11), but only on that major version: no multi-version matrix was run, and the
   concurrency evidence (`40P01`, `40001`, `55P03`) comes from deliberately
   provoked single deadlock / serialization / lock-timeout scenarios, not from a
   sustained contention benchmark. `25P02` ("current transaction is aborted") is
-  deliberately *not* classified as transient: it is the effect of an earlier
-  abort, and the classifier is only ever handed the original error because each
-  retry opens a new transaction. `55P03` is provoked through `lock_timeout`; a
+  deliberately *not* classified as transient — the server produces it for real
+  in T34t, and T34u–T34w show it is refused rather than retried: it is the
+  effect of an earlier abort, and the classifier is only ever handed the
+  original error because each retry opens a new transaction. `55P03` is provoked through `lock_timeout`; a
   plain unbounded wait would hang rather than error, which is why the tests set
   the timeout the way a deployment would. SQLite remains the dialect every
   other test uses.
@@ -469,12 +495,14 @@ the non-live half), `Frontend (typecheck + build)`.
 ## 12. Verdict
 
 `V3 PHASE 1: PASSED` — every Phase 1 acceptance item is evidenced, including
-the PostgreSQL path (T34, T34b–T34s on real PostgreSQL 16.2/16.9 servers, and the
+the PostgreSQL path (T34, T34b–T34w on real PostgreSQL 16.2/16.9 servers, and the
 CI `postgres-gate` job that keeps it verified). The retry policy is
 dialect-aware: PostgreSQL deadlocks (`40P01`), serialization failures (`40001`)
 and lock timeouts (`55P03`) are recognised from the driver's SQLSTATE and
 retried in a fresh transaction, while constraint, authorization, missing-table,
-connection and configuration errors are not retried at all (T34j–T34s, T37).
-Each transient SQLSTATE is now proven by the server itself, including
-`55P03` from a real `lock_timeout`. The three owner gates G1–G3 remain open,
-and Phase 2 has not been started.
+connection and configuration errors are not retried at all — including the
+server's own `25P02` abort effect (T34j–T34w, T37). Each transient SQLSTATE is
+proven by the server itself, including `55P03` from a real `lock_timeout`, and
+the one SQLSTATE that looks like contention but is not a cause (`25P02`) is
+proven to be refused. The three owner gates G1–G3 remain open, and Phase 2 has
+not been started.

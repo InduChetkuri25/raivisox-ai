@@ -1,4 +1,4 @@
-"""V3 Phase 1 acceptance tests — the PostgreSQL path (T34b–T34s).
+"""V3 Phase 1 acceptance tests — the PostgreSQL path (T34b–T34w).
 
 T34 (`test_migration_003.py`) proves that migration 003 applies on a
 PostgreSQL URL. That is necessary but not sufficient: the writer, the audit
@@ -1354,3 +1354,220 @@ async def test_postgres_audit_flush_survives_a_real_lock_timeout(pg_stack, migra
         assert await count_rows(pg_stack, "audit_links") == 1
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Aborted-transaction evidence — genuine 25P02 (in_failed_sql_transaction)
+# ---------------------------------------------------------------------------
+
+
+async def _capture_in_failed_transaction(url: str) -> tuple[DBAPIError, DBAPIError]:
+    """Abort a real transaction and return its cause plus the server's 25P02.
+
+    The cause is a genuine unique-constraint violation (``23505``) raised by
+    PostgreSQL; every later statement in that same transaction is then answered
+    by the server with ``25P02`` ("current transaction is aborted, commands
+    ignored..."). The connection runs in AUTOCOMMIT isolation so each
+    statement reaches the server as written — SQLAlchemy's client-side "pending
+    rollback" guard is never substituted for the server's own error.
+
+    Both exceptions are the ones asyncpg raised through SQLAlchemy: nothing here
+    synthesises a message or infers a SQLSTATE from text.
+    """
+    engine = create_async_engine(url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+    cause: DBAPIError | None = None
+    followup: DBAPIError | None = None
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS abort_probe "
+                    "(id integer PRIMARY KEY, v integer)"
+                )
+            )
+            await conn.execute(text("DELETE FROM abort_probe"))
+            await conn.execute(text("INSERT INTO abort_probe (id, v) VALUES (1, 0)"))
+            await conn.execute(text("BEGIN"))
+            try:
+                await conn.execute(text("INSERT INTO abort_probe (id, v) VALUES (1, 1)"))
+            except DBAPIError as exc:
+                cause = exc
+            try:
+                await conn.execute(text("SELECT 1"))
+            except DBAPIError as exc:
+                followup = exc
+            try:
+                await conn.execute(text("ROLLBACK"))
+            except DBAPIError:  # pragma: no cover - the transaction is already dead
+                pass
+    finally:
+        await engine.dispose()
+
+    assert cause is not None, "the duplicate insert did not raise"
+    assert followup is not None, "PostgreSQL did not reject a statement in the aborted transaction"
+    return cause, followup
+
+
+class _FailedFirstSession:
+    """Session proxy whose first write raises the real 25P02 at commit.
+
+    Read-only work (the provenance check) passes through, so the genuine error
+    lands exactly on the transaction under test.
+    """
+
+    def __init__(self, session, error) -> None:
+        self._session = session
+        self._error = error
+
+    async def __aenter__(self):
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return await self._session.__aexit__(*exc_info)
+
+    def add(self, obj):
+        self._session.add(obj)
+
+    async def execute(self, *args, **kwargs):
+        return await self._session.execute(*args, **kwargs)
+
+    async def commit(self):
+        if self._error is not None:
+            error, self._error = self._error, None
+            raise error
+        return await self._session.commit()
+
+    async def rollback(self):
+        return await self._session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# T34t — a real 25P02 is not a transient cause
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_in_failed_transaction_is_not_transient(migrated):
+    cause, followup = await _capture_in_failed_transaction(migrated)
+
+    # The cause is a permanent constraint violation, never retried.
+    assert events._sqlstate(cause) == "23505", (
+        f"driver did not expose the constraint SQLSTATE: {cause!r}"
+    )
+    assert events._is_transient_lock(cause) is False
+
+    # The server's own 25P02 is the *effect* of that abort, not a cause: a retry
+    # could not succeed and would hide the constraint that actually failed.
+    assert events._sqlstate(followup) == "25P02", (
+        f"driver did not expose the aborted-transaction SQLSTATE: {followup!r}"
+    )
+    assert events._is_transient_lock(followup) is False
+    assert events._is_missing_table(followup) is False
+    assert "current transaction is aborted" in str(followup)
+
+
+# ---------------------------------------------------------------------------
+# T34u — even if 25P02 reached the writer, it is not retried
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_does_not_retry_in_failed_transaction(pg_stack, migrated):
+    _cause, followup = await _capture_in_failed_transaction(migrated)
+    factory = _failing_factory(pg_stack.factory, [followup])
+
+    assert await emit_event(pg_stack, session_factory=factory) is False
+    assert events.counters()["retries"] == 0, "an aborted-transaction error is never retried"
+    assert events.counters()["failures"] == 1
+    assert await count_rows(pg_stack) == 0, "a failed transaction leaves no row"
+
+    # The refusal is honest, not fatal: recording is still enabled afterwards.
+    assert await emit_event(pg_stack) is True
+    assert events.counters()["written"] == 1
+    assert await count_rows(pg_stack) == 1
+
+
+# ---------------------------------------------------------------------------
+# T34v — a failed session is never reused; each attempt gets a clean one
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_aborted_session_is_not_reused(pg_stack):
+    from sqlalchemy.exc import PendingRollbackError
+
+    # A genuine server error aborts the transaction behind this session.
+    async with pg_stack.factory() as session:
+        with pytest.raises(DBAPIError) as raised:
+            await session.execute(text("SELECT 1 / 0"))
+        assert events._sqlstate(raised.value) == "22012"  # division_by_zero
+        assert events._is_transient_lock(raised.value) is False
+
+        # A second statement on the dead transaction is either answered by the
+        # server with 25P02 or refused client-side; both mean the transaction is
+        # unusable, which is why the writer opens a session per attempt.
+        try:
+            await session.execute(text("SELECT 1"))
+        except DBAPIError as exc:
+            assert events._sqlstate(exc) == "25P02"
+            assert events._is_transient_lock(exc) is False
+        except PendingRollbackError:
+            pass
+        else:  # pragma: no cover - a server that silently accepts this would be broken
+            pytest.fail("an aborted transaction accepted a further statement")
+        await session.rollback()
+
+    # The next attempt starts from a clean transaction, as the writer's
+    # per-attempt session does, and sees no 25P02.
+    async with pg_stack.factory() as session:
+        assert (await session.execute(text("SELECT 1"))).scalar() == 1
+
+    assert await emit_event(pg_stack) is True
+    assert events.counters()["retries"] == 0
+    assert await count_rows(pg_stack) == 1
+
+
+# ---------------------------------------------------------------------------
+# T34w — a real 25P02 at the flush keeps every queued event
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_audit_flush_keeps_queue_after_in_failed_transaction(
+    pg_stack, migrated
+):
+    AuditTrail.instance().log(
+        actor_id="pipeline-service",
+        action="tool:fs_write",
+        resource="x",
+        allowed=True,
+        user_id=pg_stack.user_id,
+        task_id=pg_stack.task_id,
+        run_id=pg_stack.run_id,
+        step_node_id="step-1",
+        action_id=str(uuid.uuid4()),
+    )
+    AuditTrail.instance().log(
+        actor_id="legacy-actor", action="api:view_audit", resource="audit", allowed=True
+    )
+    assert AuditTrail.instance().pending_count() == 2
+
+    _cause, followup = await _capture_in_failed_transaction(migrated)
+    async with _FailedFirstSession(pg_stack.factory(), followup) as failing:
+        with pytest.raises(DBAPIError) as raised:
+            await AuditTrail.instance().flush_pending(failing)
+        assert events._sqlstate(raised.value) == "25P02"
+
+    # Nothing acknowledged, nothing persisted: both events stay queued.
+    assert AuditTrail.instance().pending_count() == 2
+    assert await count_rows(pg_stack, "audit_events") == 0
+    assert await count_rows(pg_stack, "audit_links") == 0
+
+    # A clean session writes each event once, with its link.
+    async with pg_stack.factory() as session:
+        assert await AuditTrail.instance().flush_pending(session) == 2
+    assert AuditTrail.instance().pending_count() == 0
+    assert await count_rows(pg_stack, "audit_events") == 2
+    assert await count_rows(pg_stack, "audit_links") == 1
+
+    async with pg_stack.factory() as session:
+        assert await AuditTrail.instance().flush_pending(session) == 0
+    assert await count_rows(pg_stack, "audit_events") == 2
+    assert await count_rows(pg_stack, "audit_links") == 1

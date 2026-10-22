@@ -842,8 +842,8 @@ evidence.
 Everything else is raised on the first attempt: constraint violations (`23xxx`), insufficient
 privilege (`42501`), undefined table (`42P01`, which instead disables recording for the
 process), failed connections (`08xxx`), authentication (`28P01`), `25P02`
-(`in_failed_sql_transaction` — the *effect* of an earlier abort, not a cause) and
-`57014` (cancelled). Retrying those would only delay an honest failure.
+(`in_failed_sql_transaction` — the *effect* of an earlier abort, not a cause, proven by
+T34t) and `57014` (cancelled). Retrying those would only delay an honest failure.
 
 **The transaction is always restarted.** Each attempt opens a new session, so a retried
 write never continues inside a transaction PostgreSQL has already aborted (that would fail
@@ -861,11 +861,13 @@ flusher is different on purpose: `AuditTrail.flush_pending` re-raises its final 
 leaves the events queued for the next flush.
 
 Tests: `tests/unit/test_transient_retry.py` (classification table, bounded retries,
-propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34s` prove the
+propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34w` prove the
 same policy against a real PostgreSQL server, with every SQLSTATE produced by the server
-itself: a genuine deadlock (`40P01`), a genuine SERIALIZABLE conflict (`40001`) and a
+itself: a genuine deadlock (`40P01`), a genuine SERIALIZABLE conflict (`40001`), a
 genuine `55P03` (`lock_not_available`) raised when a `lock_timeout` on the writer's own
-session expires against a concurrent `ACCESS EXCLUSIVE` lock.
+session expires against a concurrent `ACCESS EXCLUSIVE` lock, and a genuine `25P02`
+returned by a statement issued into a transaction the server had already aborted — the
+effect of that abort, which is rejected as a cause and never retried (T34t–T34w).
 
 ### 8.3 No partial events
 
@@ -963,6 +965,10 @@ marked *existing*).
 | T34q | `test_postgres_phase1.py::test_postgres_writer_gives_up_after_real_lock_timeouts` | `ACCESS EXCLUSIVE` held on `graph_events`; the writer's connections carry `lock_timeout` | `emit()` | every attempt meets the real lock: `False`, 2 retries, 1 failure, 0 rows; after release the same action writes exactly once and a second emit is a duplicate; recording stays enabled | persistent lock contention is bounded, leaves nothing behind, and cannot duplicate |
 | T34r | `test_postgres_phase1.py::test_postgres_writer_retry_commits_once_when_the_lock_clears` | the same real lock, cleared as the first `55P03` propagates | `emit()` | 1 retry, 1 row written, 0 failures, 0 duplicates | a retry restarts the transaction and commits exactly once |
 | T34s | `test_postgres_phase1.py::test_postgres_audit_flush_survives_a_real_lock_timeout` | `ACCESS EXCLUSIVE` on `audit_links`, so the *link* insert is what blocks | `flush_pending` twice | the real `55P03` persists nothing and keeps both events queued; no orphan audit row and no orphan link; the retry writes 2 audit rows + 1 link; a third flush writes 0 | lock contention cannot acknowledge or duplicate audit evidence |
+| T34t | `test_postgres_phase1.py::test_postgres_in_failed_transaction_is_not_transient` | a real `23505` aborts a transaction; the next statement in it is answered by the server | classify | the cause is `23505`, not transient; the follow-up is `25P02` ("current transaction is aborted…"), also **not** transient and not a missing table | the abort *effect* is never mistaken for a retryable cause |
+| T34u | `test_postgres_phase1.py::test_postgres_writer_does_not_retry_in_failed_transaction` | the real `25P02` object raised at the writer's commit | `emit()` | `False`, **0 retries**, 1 failure, 0 rows; recording stays enabled and a later emit succeeds | even if `25P02` reached the writer it would not be retried |
+| T34v | `test_postgres_phase1.py::test_postgres_aborted_session_is_not_reused` | a real `22012` aborts a session from the writer's own factory; the session is then reused | second statement, then a fresh session | the dead transaction answers `25P02` (or is refused client-side); a fresh session is clean and the next `emit()` writes one row with 0 retries | the writer's per-attempt session is why it never receives `25P02` |
+| T34w | `test_postgres_phase1.py::test_postgres_audit_flush_keeps_queue_after_in_failed_transaction` | the real `25P02` raised at the flush commit | `flush_pending` twice | nothing acknowledged or persisted, both events still queued; a clean session writes 2 audit rows + 1 link once; a further flush writes 0 | a non-retryable failure never drops queued audit evidence |
 | T37 | `tests/unit/test_transient_retry.py` (34 tests, no server needed) | fake driver errors carrying `sqlstate`/`pgcode`, and a flaky session factory over real SQLite | classify + `emit()` | `40P01`/`40001`/`40000`/`55P03` transient; `23505`/`23503`/`42501`/`42P01`/`25P02`/`08xxx`/`28P01`/`57014` not; SQLite lock text still transient; bounded attempts; final error propagated to the caller; `CancelledError` not swallowed; duplicate still a duplicate | the policy is pinned on every host, including the classification table PG cannot enumerate cheaply |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | unchanged | run | still passes (zero drift) | model and migration cannot diverge |
 | T36 | Existing suites (`tests/unit/*`, live container gate) | unchanged | run | all previously passing tests still pass; counts unchanged | no regression to authorization, sandbox, quotas, digest pinning |
