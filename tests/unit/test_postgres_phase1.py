@@ -1,4 +1,4 @@
-"""V3 Phase 1 acceptance tests — the PostgreSQL path (T34b–T34w).
+"""V3 Phase 1 acceptance tests — the PostgreSQL path (T34b–T34y).
 
 T34 (`test_migration_003.py`) proves that migration 003 applies on a
 PostgreSQL URL. That is necessary but not sufficient: the writer, the audit
@@ -1571,3 +1571,114 @@ async def test_postgres_audit_flush_keeps_queue_after_in_failed_transaction(
         assert await AuditTrail.instance().flush_pending(session) == 0
     assert await count_rows(pg_stack, "audit_events") == 2
     assert await count_rows(pg_stack, "audit_links") == 1
+
+
+# ---------------------------------------------------------------------------
+# A real 40001 → 25P02 chain: the cause is retryable, the effect is not
+# ---------------------------------------------------------------------------
+
+
+async def _capture_serialization_then_abort(url: str) -> tuple[DBAPIError, DBAPIError]:
+    """Produce a real ``40001`` and the ``25P02`` that follows it in one transaction.
+
+    Two SERIALIZABLE transactions read the same row; the first to write commits,
+    the second is refused by PostgreSQL with ``40001`` ("could not serialize
+    access due to concurrent update"). A further statement in that same, now
+    aborted, transaction is answered with ``25P02``.
+
+    AUTOCOMMIT isolation plus explicit ``BEGIN`` means each statement reaches the
+    server as written, so both errors are the driver's own objects and neither
+    SQLSTATE is synthesised here.
+    """
+    engine = create_async_engine(url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+    cause: DBAPIError | None = None
+    followup: DBAPIError | None = None
+    try:
+        async with engine.begin() as setup:
+            await setup.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS serial_chain "
+                    "(id integer PRIMARY KEY, v integer)"
+                )
+            )
+            await setup.execute(text("DELETE FROM serial_chain"))
+            await setup.execute(text("INSERT INTO serial_chain (id, v) VALUES (1, 0)"))
+
+        async with engine.connect() as conn_a, engine.connect() as conn_b:
+            await conn_a.execute(text("BEGIN ISOLATION LEVEL SERIALIZABLE"))
+            await conn_b.execute(text("BEGIN ISOLATION LEVEL SERIALIZABLE"))
+            # Both transactions take the same snapshot before either writes.
+            await conn_a.execute(text("SELECT v FROM serial_chain WHERE id = 1"))
+            await conn_b.execute(text("SELECT v FROM serial_chain WHERE id = 1"))
+            await conn_a.execute(text("UPDATE serial_chain SET v = v + 1 WHERE id = 1"))
+            await conn_a.execute(text("COMMIT"))
+            try:
+                await conn_b.execute(
+                    text("UPDATE serial_chain SET v = v + 1 WHERE id = 1")
+                )
+            except DBAPIError as exc:
+                cause = exc
+            try:
+                await conn_b.execute(text("SELECT 1"))
+            except DBAPIError as exc:
+                followup = exc
+            try:
+                await conn_b.execute(text("ROLLBACK"))
+            except DBAPIError:  # pragma: no cover - the transaction is already dead
+                pass
+    finally:
+        await engine.dispose()
+
+    assert cause is not None, "PostgreSQL did not report the serialization failure"
+    assert followup is not None, "the aborted transaction accepted a further statement"
+    return cause, followup
+
+
+# ---------------------------------------------------------------------------
+# T34x — the chain is classified from its cause, not its abort effect
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_serialization_chain_keeps_the_cause_retryable(migrated):
+    cause, followup = await _capture_serialization_then_abort(migrated)
+
+    assert events._sqlstate(cause) == "40001", (
+        f"driver did not expose the serialization SQLSTATE: {cause!r}"
+    )
+    assert events._is_transient_lock(cause) is True
+
+    assert events._sqlstate(followup) == "25P02", (
+        f"driver did not expose the aborted-transaction SQLSTATE: {followup!r}"
+    )
+    assert events._is_transient_lock(followup) is False
+    assert events._is_missing_table(followup) is False
+
+
+# ---------------------------------------------------------------------------
+# T34y — the chain's cause is retried in a fresh transaction, exactly once
+# ---------------------------------------------------------------------------
+
+
+async def test_postgres_writer_retries_chain_cause_in_a_fresh_transaction(
+    pg_stack, migrated
+):
+    cause, followup = await _capture_serialization_then_abort(migrated)
+    factory = _failing_factory(pg_stack.factory, [cause])
+    action_id = live_action()
+
+    assert await emit_event(pg_stack, action_id=action_id, session_factory=factory) is True
+    assert events.counters()["retries"] == 1, "one retry, so the second attempt was a new transaction"
+    assert events.counters()["written"] == 1
+    assert events.counters()["failures"] == 0
+
+    rows = await fetch_rows(pg_stack)
+    assert len(rows) == 1
+    assert rows[0]["action_id"] == action_id
+
+    # The abort effect is never what gets retried, and it stays non-retryable.
+    assert events._is_transient_lock(followup) is False
+
+    # Idempotency survives the retry: the same fact is still one row.
+    assert await emit_event(pg_stack, action_id=action_id) is True
+    assert events.counters()["duplicates"] == 1
+    assert await count_rows(pg_stack) == 1

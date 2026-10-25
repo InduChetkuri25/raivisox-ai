@@ -861,13 +861,19 @@ flusher is different on purpose: `AuditTrail.flush_pending` re-raises its final 
 leaves the events queued for the next flush.
 
 Tests: `tests/unit/test_transient_retry.py` (classification table, bounded retries,
-propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34w` prove the
+propagation, cancellation, dedupe after retry) runs on every host; `T34j–T34y` prove the
 same policy against a real PostgreSQL server, with every SQLSTATE produced by the server
 itself: a genuine deadlock (`40P01`), a genuine SERIALIZABLE conflict (`40001`), a
 genuine `55P03` (`lock_not_available`) raised when a `lock_timeout` on the writer's own
 session expires against a concurrent `ACCESS EXCLUSIVE` lock, and a genuine `25P02`
 returned by a statement issued into a transaction the server had already aborted — the
-effect of that abort, which is rejected as a cause and never retried (T34t–T34w).
+effect of that abort, which is rejected as a cause and never retried (T34t–T34w). The two
+errors are also observed as one real chain: a SERIALIZABLE conflict aborts the
+transaction and the next statement in it answers `25P02`, so the classifier is shown to
+retry the cause (`40001`) while refusing the effect (`25P02`), and the retry path commits
+exactly once in a fresh transaction (T34x–T34y). This closes the retry matrix: the rule is
+the cause's SQLSTATE category, both directions of a real chain are pinned, and no further
+SQLSTATE is added without a concrete failure that this rule would misclassify.
 
 ### 8.3 No partial events
 
@@ -969,6 +975,8 @@ marked *existing*).
 | T34u | `test_postgres_phase1.py::test_postgres_writer_does_not_retry_in_failed_transaction` | the real `25P02` object raised at the writer's commit | `emit()` | `False`, **0 retries**, 1 failure, 0 rows; recording stays enabled and a later emit succeeds | even if `25P02` reached the writer it would not be retried |
 | T34v | `test_postgres_phase1.py::test_postgres_aborted_session_is_not_reused` | a real `22012` aborts a session from the writer's own factory; the session is then reused | second statement, then a fresh session | the dead transaction answers `25P02` (or is refused client-side); a fresh session is clean and the next `emit()` writes one row with 0 retries | the writer's per-attempt session is why it never receives `25P02` |
 | T34w | `test_postgres_phase1.py::test_postgres_audit_flush_keeps_queue_after_in_failed_transaction` | the real `25P02` raised at the flush commit | `flush_pending` twice | nothing acknowledged or persisted, both events still queued; a clean session writes 2 audit rows + 1 link once; a further flush writes 0 | a non-retryable failure never drops queued audit evidence |
+| T34x | `test_postgres_phase1.py::test_postgres_serialization_chain_keeps_the_cause_retryable` | two SERIALIZABLE transactions over the same row: the second is refused with `40001`, and its next statement answers `25P02` | classify both | the cause is `40001` and transient; the effect is `25P02` and **not** transient, and not a missing table | in one real chain, only the cause is retryable |
+| T34y | `test_postgres_phase1.py::test_postgres_writer_retries_chain_cause_in_a_fresh_transaction` | the real `40001` from that chain raised at the writer's commit | `emit()`, then a repeat emit of the same action | 1 retry, 1 row, 0 failures; the abort effect is never the thing retried; the repeat emit is a duplicate and the table still holds one row | the chain's retry restarts the transaction and cannot double-write |
 | T37 | `tests/unit/test_transient_retry.py` (34 tests, no server needed) | fake driver errors carrying `sqlstate`/`pgcode`, and a flaky session factory over real SQLite | classify + `emit()` | `40P01`/`40001`/`40000`/`55P03` transient; `23505`/`23503`/`42501`/`42P01`/`25P02`/`08xxx`/`28P01`/`57014` not; SQLite lock text still transient; bounded attempts; final error propagated to the caller; `CancelledError` not swallowed; duplicate still a duplicate | the policy is pinned on every host, including the classification table PG cannot enumerate cheaply |
 | T35 | `test_production_hardening.py::test_alembic_upgrade_head_matches_model_schema` (existing) | unchanged | run | still passes (zero drift) | model and migration cannot diverge |
 | T36 | Existing suites (`tests/unit/*`, live container gate) | unchanged | run | all previously passing tests still pass; counts unchanged | no regression to authorization, sandbox, quotas, digest pinning |
