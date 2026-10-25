@@ -259,7 +259,7 @@ pytest 9.1.1):
 | PostgreSQL migration + PG gate | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py -q` | **27 passed, 0 skipped** |
 | Full backend | `python -m pytest tests/unit -q` | **653 passed, 72 skipped, 0 failed** (725 collected; see §7 for the PG run) |
 | Full backend, every test directory, with PostgreSQL | `RAIVISOX_TEST_POSTGRES_URL=... python -m pytest tests -q` | **678 passed, 51 skipped, 0 failed** (729 collected, 860 s) |
-| Full backend, every test directory | `python -m pytest tests -q` | **653 passed, 76 skipped, 0 failed** (729 collected, 558 s) |
+| Full backend, every test directory | `python -m pytest tests -q` | **653 passed, 76 skipped, 0 failed** (729 collected, 434 s) |
 | Container gate, non-live half | `python -m pytest tests/unit/test_sandbox_phase4.py tests/unit/test_container_app_path.py tests/unit/test_sandbox_phase5.py -m "not live" -q` | 62 passed, 5 skipped, 19 deselected |
 | Frontend typecheck | `cd apps/web && npx tsc --noEmit` | exit 0, no diagnostics |
 | Frontend production build | `cd apps/web && npm run build` (`next build`, Next 15.1.6) | exit 0, 6 routes generated |
@@ -282,16 +282,16 @@ Linux CI (`ubuntu-latest`) for the same commit, from the run's logs:
 
 | Job / step | Result |
 |---|---|
-| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 55 skipped, 0 failed** (727 collected, 123 s) |
-| `backend-tests` — explicit `-m "not live_llm"` selection | 672 passed, 51 skipped, 4 deselected |
-| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **25 passed, 0 skipped** (the job fails on any skip) |
+| `backend-tests` — full suite (`python -m pytest -q`) | **672 passed, 57 skipped, 0 failed** (729 collected, 132 s) |
+| `backend-tests` — explicit `-m "not live_llm"` selection | 672 passed, 53 skipped, 4 deselected |
+| `postgres-gate` — PostgreSQL-gated tests against a `postgres:16-alpine` service | **27 passed, 0 skipped** (the job fails on any skip) |
 | `container-gate` — docker runtime proof | Docker `server=28.0.4 client=28.0.4`; digest-pinned image ran |
 | `container-gate` — live container tests (`-m live`) | **19 passed, 0 skipped** (a skip fails the gate) |
 | `container-gate` — non-live half | 64 passed, 3 skipped, 19 deselected |
 | `frontend-validation` — `tsc --noEmit` + `npm run build` | passed, build compiled successfully |
 
-CI and the Windows host now collect the same 727 items (`pytest -q` in CI,
-`pytest tests -q` locally). CI skips 55 and the host 74, because several
+CI and the Windows host now collect the same 729 items (`pytest -q` in CI,
+`pytest tests -q` locally). CI skips 57 and the host 76, because several
 sandbox/container tests are POSIX-only; no test that passes locally fails there.
 The SQLite backend job skips the twenty-five PostgreSQL-gated tests by design; the
 separate `postgres-gate` job runs them.
@@ -465,6 +465,18 @@ Nothing here is a human approval of those gates.
   started.
 
 ## 11. CI and delivery
+
+GitHub Actions run **40172988124** for commit `704fb7c` (the `40001 → 25P02`
+chain) — **success**, all four jobs green: `Backend tests (pytest)` 672 passed /
+57 skipped / 0 failed (729 collected), and 672 passed / 53 skipped / 4
+deselected for the explicit `-m "not live_llm"` selection; `PostgreSQL gate
+(real server)` **27 passed, 0 skipped** against a `postgres:16-alpine` service
+(the job fails on any skip), so `…_serialization_chain_keeps_the_cause_retryable`
+and `…_writer_retries_chain_cause_in_a_fresh_transaction` produce the real chain
+on the CI-pinned SQLAlchemy and driver too; `Container sandbox gate (live
+Docker)` Docker `server=28.0.4 client=28.0.4`, 19 live passed / 0 skipped plus
+64 passed / 3 skipped in the non-live half; `Frontend (typecheck + build)`
+typecheck clean and `Compiled successfully`.
 
 GitHub Actions run **39761493290** for commit `84cf4e6` (the `25P02` evidence) —
 **success**, all four jobs green: `Backend tests (pytest)` 672 passed / 55
