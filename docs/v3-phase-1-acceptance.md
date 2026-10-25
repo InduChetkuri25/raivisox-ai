@@ -506,6 +506,22 @@ Nothing here is a human approval of those gates.
 
 ## 11. CI and delivery
 
+GitHub Actions run **40182067467** for commit `ddb83da` (the pinned 16.9 gate)
+— **success** on re-run, all five jobs green: `Backend tests (pytest)` 672
+passed / 57 skipped / 0 failed (729 collected), and 672 passed / 53 skipped / 4
+deselected for the explicit `-m "not live_llm"` selection; `PostgreSQL gate
+(real server)` **27 passed, 0 skipped** against `postgres:16-alpine`; the new
+`PostgreSQL gate (16.9, pinned)` **27 passed, 0 skipped** against
+`postgres:16.9`, whose first step printed `server_version = 16.9 (Debian
+16.9-1.pgdg130+1)` read from the running server before any test started;
+`Container sandbox gate (live Docker)` 19 live passed / 0 skipped plus 64
+passed / 3 skipped in the non-live half; `Frontend (typecheck + build)` passed.
+The first attempt of this run failed only the `-m "not live_llm"` step, on
+`test_capability_audit.py::test_http_allowlisted_host_is_real` with `AssertionError:
+HTTP 503 from https://example.com` — a live third-party fetch, and the same test
+passed in the full-suite step of that same attempt. The job was re-run
+unchanged and passed; no test, assertion or workflow was relaxed to get there.
+
 GitHub Actions run **40172988124** for commit `704fb7c` (the `40001 → 25P02`
 chain) — **success**, all four jobs green: `Backend tests (pytest)` 672 passed /
 57 skipped / 0 failed (729 collected), and 672 passed / 53 skipped / 4
@@ -569,8 +585,9 @@ the non-live half), `Frontend (typecheck + build)`.
   concurrency conflicts by SQLSTATE`), `1cbe7ab` (`test(v3): prove 55P03 lock
   timeouts against a real PostgreSQL server`), `84cf4e6` (`test(v3): prove
   25P02 is refused, not retried, against real PostgreSQL`) and `704fb7c`
-  (`test(v3): prove one real 40001 → 25P02 chain retries only its cause`), all
-  pushed to `origin/main`.
+  (`test(v3): prove one real 40001 → 25P02 chain retries only its cause`), plus
+  `ddb83da` (`ci(v3): gate PostgreSQL 16.9 by version and record the parity
+  run`), all pushed to `origin/main`.
 - `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
   started.
 - Working tree clean after the documentation commit that records this report.
