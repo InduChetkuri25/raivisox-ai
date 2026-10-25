@@ -786,9 +786,12 @@ deployment that runs new code against an un-migrated database loses events, not 
 PostgreSQL behaviour is verified only where a real PG URL is supplied: `T34` plus the
 `test_postgres_phase1.py` gate cover schema, round-trip, the atomic audit/link write, FK
 cascades, legacy rows and restart. The `backend-tests` CI job uses SQLite; a dedicated
-`postgres-gate` job runs the PG tests against `postgres:16-alpine`. The PG-specific tests are
-marked and skipped with an explicit reason when `RAIVISOX_TEST_POSTGRES_URL` is absent — with
-no URL **PG verification is not claimed** (§9, §11.1 R11). A recorded PostgreSQL 16.9 run is in
+`postgres-gate` job runs the PG tests against `postgres:16-alpine`, and a second
+`postgres-gate-16-9` job runs the same gate on the pinned `postgres:16.9` image after
+asserting the running server reports that version, so the versions the evidence names are
+re-checked rather than assumed. The PG-specific tests are marked and skipped with an
+explicit reason when `RAIVISOX_TEST_POSTGRES_URL` is absent — with no URL **PG verification
+is not claimed** (§9, §11.1 R11). Recorded PostgreSQL 16.2 and 16.9 runs are in
 [v3-phase-1-acceptance.md](v3-phase-1-acceptance.md) §7.
 
 ### 7.7 Existing records
@@ -871,9 +874,14 @@ effect of that abort, which is rejected as a cause and never retried (T34t–T34
 errors are also observed as one real chain: a SERIALIZABLE conflict aborts the
 transaction and the next statement in it answers `25P02`, so the classifier is shown to
 retry the cause (`40001`) while refusing the effect (`25P02`), and the retry path commits
-exactly once in a fresh transaction (T34x–T34y). This closes the retry matrix: the rule is
-the cause's SQLSTATE category, both directions of a real chain are pinned, and no further
-SQLSTATE is added without a concrete failure that this rule would misclassify.
+exactly once in a fresh transaction (T34x–T34y). Those chain tests are not tied to one
+patch release: they were first produced on PostgreSQL 16.2 and then re-run unchanged on a
+second, independently installed PostgreSQL 16.9 server, where the server again answered
+`40001` for the conflict and `25P02` for the next statement in the aborted transaction and
+the same 1-retry/1-row outcome followed (acceptance report §7, 16.9 parity). This closes
+the retry matrix: the rule is the cause's SQLSTATE category, both directions of a real
+chain are pinned on both server versions, and no further SQLSTATE is added without a
+concrete failure that this rule would misclassify.
 
 ### 8.3 No partial events
 
@@ -992,8 +1000,9 @@ Additional non-functional assertions:
 ### 9.1 Explicitly not tested / not claimed
 
 - PostgreSQL is **not verified** unless a PG URL is provided: the SQLite
-  `backend-tests` job skips the PG-gated tests. A recorded PostgreSQL 16.9 run is in the
-  acceptance report, and the CI `postgres-gate` job repeats it.
+  `backend-tests` job skips the PG-gated tests. Recorded PostgreSQL 16.2 and 16.9 runs are
+  in the acceptance report, and the CI `postgres-gate` and `postgres-gate-16-9` jobs
+  repeat them.
 - Sandboxed child I/O remains unobservable; no test asserts events for it.
 - Multi-replica clock skew is not exercised.
 
@@ -1045,7 +1054,7 @@ the registry so no event is ever written with an unverified `user_id`.
 | R8 | `Integer` `seq` ceiling (~2.1B) | future table rebuild | ≈ 49 years at design §10 volume; monitor `max(seq)`; D6 |
 | R9 | A compromised adapter lies in its `observed` events | misleading graph | `evidence_class` stays `observed`; only artifact registration is `verified`; Phase 4 forbids promotion |
 | R10 | Provenance resolution adds one query per run | negligible | once per run, not per event |
-| R11 | a PG-only DDL/behaviour defect can pass the SQLite suite | a PG regression reaches production unnoticed | T34 + `test_postgres_phase1.py` gated on `RAIVISOX_TEST_POSTGRES_URL`, verified on PostgreSQL 16.9 (acceptance report §7) and run on every push by the CI `postgres-gate` job, which fails on any skip |
+| R11 | a PG-only DDL/behaviour defect can pass the SQLite suite | a PG regression reaches production unnoticed | T34 + `test_postgres_phase1.py` gated on `RAIVISOX_TEST_POSTGRES_URL`, verified on PostgreSQL 16.2 and 16.9 (acceptance report §7) and run on every push by the CI `postgres-gate` and `postgres-gate-16-9` jobs, which fail on any skip |
 | R12 | SQLite runs without `PRAGMA foreign_keys`, so FKs are declarative there | a reader might over-trust the constraint | the guarantees are the writer's single transaction (T18b) and the run-start ownership check (T13–T17); PG enforces the FKs |
 
 ### 11.2 Decision summary (all 12 classified)

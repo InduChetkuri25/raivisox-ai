@@ -308,17 +308,18 @@ separate `postgres-gate` job runs them.
 - **PostgreSQL (verified).** The PostgreSQL path was verified against a real
   server. The lock-contention, aborted-transaction and error-chain evidence
   below (T34p–T34y) was produced on PostgreSQL **16.2**; the earlier Phase 1
-  run (T34b–T34o) used **16.9**. Both are the same major version as the
-  `postgres:16-alpine` service the compose files ship. Each instance was a
-  throwaway cluster reachable only on `127.0.0.1` with trust auth scoped to that
-  loopback address; no credential was written to the repository, the URL was
-  exported only into the test process environment, and the cluster was stopped
-  and deleted after the run.
+  run (T34b–T34o) used **16.9**, and the whole gate — including T34x–T34y — was
+  then repeated on a second, independently provisioned **16.9** server (16.9
+  parity below). Both are the same major version as the `postgres:16-alpine`
+  service the compose files ship. Each instance was a throwaway cluster reachable only on
+  `127.0.0.1` with trust auth scoped to that loopback address; no credential was
+  written to the repository, the URL was exported only into the test process
+  environment, and the cluster was stopped and deleted after the run.
 
   | Run | Result |
   |---|---|
   | `test_migration_003.py` (T32–T34) with the PG URL | **3 passed, 0 skipped** |
-  | `test_postgres_phase1.py` (T34b–T34y) | **24 passed, 0 skipped** (16.2; 14 of them already on 16.9) |
+  | `test_postgres_phase1.py` (T34b–T34y) | **24 passed, 0 skipped** on 16.2, and again **24 passed, 0 skipped** on 16.9 (parity below) |
   | Phase 1 focused suite with the PG URL (§5) | **103 passed, 0 skipped** |
   | Full backend suite without the PG URL (§6) | **653 passed, 72 skipped, 0 failed** |
   | Full backend suite with the PG URL (§6) | **678 passed, 51 skipped, 0 failed** |
@@ -393,6 +394,39 @@ separate `postgres-gate` job runs them.
   events queued, and a clean flush writes 2 audit rows + 1 link exactly once
   (T34w).
 
+  **16.9 parity.** The 16.2 cluster above forced a deliberate check: is any of
+  that evidence a property of  the patch release rather than of the major version? A second server was
+  provisioned from the EnterpriseDB `postgresql-16.9-1-windows-x64` binaries (not the 16.2 package already present), initialised with `initdb -A
+  trust` into a fresh data directory and started on `127.0.0.1:55433`. The
+  version was read from the running server, never from the package name:
+  `SHOW server_version` returned `16.9` and `SELECT version()` returned
+  `PostgreSQL 16.9, compiled by Visual C++ build 1943, 64-bit`, matching the
+  startup log line `starting PostgreSQL 16.9`.
+
+  Against that server, the chain is byte-for-byte the same shape as on 16.2:
+  the SERIALIZABLE conflict arrives as `asyncpg.exceptions.SerializationError`
+  with `sqlstate = 40001` and `message = could not serialize access due to
+  concurrent update`, `_is_transient_lock` is `True` and `_is_missing_table` is
+  `False`; the next statement in the same transaction arrives as
+  `asyncpg.exceptions.InFailedSQLTransactionError` with `sqlstate = 25P02` and
+  `message = current transaction is aborted, commands ignored until end of
+  transaction block`, `_is_transient_lock` is `False` and `_is_missing_table` is
+  `False`. T34k, T34x and T34y pass unchanged — 1 retry, 1 row, 0 failures, a
+  repeat emit counted as a duplicate, and the abort effect never retried — so
+  neither the classification nor the fresh-session mechanism depends on the
+  patch release.
+
+  | Run against the 16.9 server | Result |
+  |---|---|
+  | `test_migration_003.py` + `test_postgres_phase1.py` (the CI gate selection) | **27 passed, 0 skipped** |
+  | Chain selection only (T34k, T34x, T34y) | **3 passed** |
+  | Retry/event/audit/link selection (the gate plus `test_transient_retry.py`, `test_graph_events.py`, `test_audit_linkage.py`, `test_fs_read_instrumentation.py`) | **90 passed, 0 skipped** |
+
+  Duplicate suppression, the three-attempt retry bound, the queued-event
+  survival at a failed audit flush and the atomic audit/link write are all
+  inside that 90-test selection, so they are re-proven on 16.9 rather than
+  inherited from the 16.2 run.
+
   Reproduce (PostgreSQL 13+, role needs `CREATEDB`: the tests create and drop
   their own throwaway databases; T34 additionally migrates the database named in
   the URL):
@@ -405,10 +439,13 @@ separate `postgres-gate` job runs them.
 
   Without the variable, all twenty-five PostgreSQL-gated tests skip with an
   explicit reason and the report says PostgreSQL is unverified — a skip is never
-  a pass. The CI workflow runs this same gate against a `postgres:16-alpine`
-  service in the `postgres-gate` job (result in §11); that job fails if any of
-  the 27 gate tests skips, so a future PG regression cannot pass CI silently
-  (R11). Nothing in the suite claims a PG guarantee from SQLite evidence.
+  a pass. The CI workflow runs this same gate twice — against the floating
+  `postgres:16-alpine` service in the `postgres-gate` job and against the
+  pinned `postgres:16.9` image in the `postgres-gate-16-9` job, which asserts
+  the *running* server reports 16.9 before running a single test (results in
+  §11). Both jobs fail if any of the 27 gate tests skips, so a future PG
+  regression cannot pass CI silently and the version the evidence names cannot
+  drift (R11). Nothing in the suite claims a PG guarantee from SQLite evidence.
 - **Driver.** T34 previously inspected the migrated schema through
   `postgresql+psycopg2`, but `psycopg2` is not a declared dependency of this
   project (only `asyncpg` is). It now inspects with asyncpg — the assertions are
@@ -443,9 +480,12 @@ Nothing here is a human approval of those gates.
 
 ## 10. Limits and rollback
 
-- PostgreSQL is verified on 16.9 (earlier run) and 16.2 (the `55P03` and
-  `25P02` evidence) by the opt-in runs above and by the CI `postgres-gate` job
-  (§11), but only on that major version: no multi-version matrix was run, and the
+- PostgreSQL is verified on 16.2 (the `55P03` and `25P02` evidence) and on
+  16.9 (the whole gate, including the `40001 → 25P02` chain, re-run on a second
+  server — 16.9 parity above) by the opt-in runs above and by the CI
+  `postgres-gate` and
+  `postgres-gate-16-9` jobs (§11), but only on that major version: no
+  multi-major-version matrix was run, and the
   concurrency evidence (`40P01`, `40001`, `55P03`) comes from deliberately
   provoked single deadlock / serialization / lock-timeout scenarios, not from a
   sustained contention benchmark. `25P02` ("current transaction is aborted") is
@@ -538,8 +578,10 @@ the non-live half), `Frontend (typecheck + build)`.
 ## 12. Verdict
 
 `V3 PHASE 1: PASSED` — every Phase 1 acceptance item is evidenced, including
-the PostgreSQL path (T34, T34b–T34y on real PostgreSQL 16.2/16.9 servers, and the
-CI `postgres-gate` job that keeps it verified). The retry policy is
+the PostgreSQL path (T34, T34b–T34y on real PostgreSQL 16.2 and 16.9 servers —
+the whole gate was re-run on 16.9 rather than extrapolated from 16.2 — and the
+CI `postgres-gate` plus pinned `postgres-gate-16-9` jobs that keep it
+verified). The retry policy is
 dialect-aware: PostgreSQL deadlocks (`40P01`), serialization failures (`40001`)
 and lock timeouts (`55P03`) are recognised from the driver's SQLSTATE and
 retried in a fresh transaction, while constraint, authorization, missing-table,

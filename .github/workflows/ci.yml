@@ -170,6 +170,102 @@ jobs:
           path: postgres_gate_results.txt
           if-no-files-found: ignore
 
+  # The gate above follows `postgres:16-alpine`, which moves between patch
+  # releases. The Phase 1 error-chain evidence (acceptance report §7) names the
+  # exact server it was produced on, so this job repeats the same gate on the
+  # pinned patch release and reads the version from the running server: a
+  # drifted image fails the job instead of silently re-labelling the evidence.
+  postgres-gate-16-9:
+    name: PostgreSQL gate (16.9, pinned)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16.9
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: raivisox_v3_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d raivisox_v3_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ENVIRONMENT: test
+      SECRET_KEY: ci-test-secret-key-not-a-real-secret-0123456789abcdef
+      RAIVISOX_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/raivisox_v3_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install API runtime dependencies
+        working-directory: apps/api
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install test dependencies
+        run: |
+          pip install "pytest>=8.0.0" "pytest-asyncio>=0.23.0" "pytest-cov>=4.0.0" \
+            "pytest-timeout>=2.3.0" \
+            "httpx>=0.27.0" "aiosqlite>=0.20.0" "email-validator>=2.0.0"
+
+      # The tag is not evidence - the server is asked what it is running.
+      - name: Assert the running server is PostgreSQL 16.9
+        run: |
+          python - <<'PY'
+          import asyncio, sys
+
+          import asyncpg
+
+
+          async def main() -> None:
+              conn = await asyncpg.connect(
+                  "postgresql://postgres:postgres@localhost:5432/raivisox_v3_test"
+              )
+              try:
+                  reported = await conn.fetchval("SHOW server_version")
+                  print(f"server_version = {reported}")
+                  print(await conn.fetchval("SELECT version()"))
+              finally:
+                  await conn.close()
+              if not reported.startswith("16.9"):
+                  sys.exit(
+                      f"::error::expected PostgreSQL 16.9, server reports {reported}"
+                  )
+
+
+          asyncio.run(main())
+          PY
+
+      - name: Run PostgreSQL-gated tests (any skip fails the gate)
+        run: |
+          set -o pipefail
+          pytest tests/unit/test_migration_003.py tests/unit/test_postgres_phase1.py \
+            -q -rs --timeout=300 | tee postgres_gate_16_9_results.txt
+          if grep -qE 'skipped|SKIPPED' postgres_gate_16_9_results.txt; then
+            echo '::error::PostgreSQL 16.9 tests skipped although the server is available - treating as gate failure'
+            exit 1
+          fi
+          grep -qE '[0-9]+ passed' postgres_gate_16_9_results.txt \
+            || { echo '::error::no PostgreSQL tests ran'; exit 1; }
+        timeout-minutes: 15
+
+      - name: Upload PostgreSQL 16.9 gate diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-gate-16-9-diagnostics
+          path: postgres_gate_16_9_results.txt
+          if-no-files-found: ignore
+
   container-gate:
     name: Container sandbox gate (live Docker)
     runs-on: ubuntu-latest
