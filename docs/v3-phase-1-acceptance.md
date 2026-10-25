@@ -527,9 +527,10 @@ the non-live half), `Frontend (typecheck + build)`.
   and audit links behind a flag`), `5384608` (`test(v3): verify Phase 1
   against a real PostgreSQL server`), `9d1672b` (`fix(v3): retry PostgreSQL
   concurrency conflicts by SQLSTATE`), `1cbe7ab` (`test(v3): prove 55P03 lock
-  timeouts against a real PostgreSQL server`) and `84cf4e6` (`test(v3): prove
-  25P02 is refused, not retried, against real PostgreSQL`), all pushed to
-  `origin/main`.
+  timeouts against a real PostgreSQL server`), `84cf4e6` (`test(v3): prove
+  25P02 is refused, not retried, against real PostgreSQL`) and `704fb7c`
+  (`test(v3): prove one real 40001 → 25P02 chain retries only its cause`), all
+  pushed to `origin/main`.
 - `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
   started.
 - Working tree clean after the documentation commit that records this report.
