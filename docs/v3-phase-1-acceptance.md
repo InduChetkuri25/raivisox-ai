@@ -521,6 +521,64 @@ The first attempt of this run failed only the `-m "not live_llm"` step, on
 HTTP 503 from https://example.com` — a live third-party fetch, and the same test
 passed in the full-suite step of that same attempt. The job was re-run
 unchanged and passed; no test, assertion or workflow was relaxed to get there.
+That flake was then fixed at the cause (commit `8568810`, below) rather than
+re-run away.
+
+**The flaky HTTP capability proof, fixed at the cause (commit `8568810`).** The
+test measured a third party's availability instead of this repository's
+behaviour: its skip probe counted *any* HTTP response as "online" (a 503 does
+not raise), and the test then asserted `status == 200` from `example.com`. The
+capability proof is now split by what each part can actually establish.
+
+The live test keeps the real socket and DNS path: the allowlisted host must be
+admitted by the real allowlist and SSRF guard, and the adapter's verdict must
+then be a 200 (success, with title and body parsed from the real bytes) or the
+far end's own non-200 status surfaced verbatim as a failure with no output. A
+third party's 5xx is therefore reported, not attributed to this code, while a
+fabricated success — or a failure carrying no HTTP verdict — still fails the
+test. A dead endpoint now skips with an explicit connectivity reason instead of
+claiming the capability is broken.
+
+Five offline tests pin the response policy against a controlled transport, so
+the happy path no longer depends on anyone's uptime: a 200 is parsed into
+status/title/content/bytes with the DNS guard shown to be consulted on admission
+and per hop; a 503 is a failure with no output; a `200` with a non-text content
+type is refused; a non-public resolution makes the adapter send nothing at all;
+and a redirect to a non-allowlisted host is refused with the target never
+fetched. Only the transport is substituted — the allowlist, the DNS/SSRF
+consult, per-hop redirect re-validation, the content-type and size handling and
+the body parsing are the production code paths, and the SSRF verdict is proven
+to be honoured rather than merely called.
+
+What the fixture deliberately does **not** claim: it says nothing about public
+DNS, TLS to a real host, or Internet reachability — production requires https on
+the scheme's default port and refuses every non-global resolved address, so a
+loopback server is unreachable by design, and a local fixture would have to
+weaken the very guard under test. That residual concern stays with the live
+test, which is where it was asserted on the CI runner in run `40462985806`.
+
+GitHub Actions run **40462985806** for commit `8568810` — **success on the first
+attempt**, all five jobs green: `Backend tests (pytest)` **677 passed / 57
+skipped / 0 failed** (734 collected) for the full suite and **677 passed / 53
+skipped / 4 deselected** for the explicit `-m "not live_llm"` selection (the
+five new tests account for 672 → 677, and the skip count is unchanged at 57, so
+the live HTTP test ran rather than skipping); `PostgreSQL gate (real server)`
+**27 passed, 0 skipped**; `PostgreSQL gate (16.9, pinned)` **27 passed, 0
+skipped** with `server_version` read from the running server as `16.9 (Debian
+16.9-1.pgdg130+1)`; `Container sandbox gate (live Docker)` green; `Frontend
+(typecheck + build)` green.
+
+Locally, on the same commit without a PostgreSQL URL or a container runtime:
+the full backend suite gave **658 passed, 76 skipped, 0 failed** in 11:04
+(exit 0), and `test_capability_audit.py` + `test_http_adapter.py` together gave
+**38 passed, 0 skipped**. The HTTP subset (`-k http`) passed **10 of 10**
+consecutive runs, and the live test was driven twice by hand — once with a
+real-shaped `HTTP 503` (passes, having asserted the honest verdict) and once
+with a verdict-less transport failure (fails) — which is the exact distinction
+the old assertion got wrong. The 76 skips are the pre-existing environment-gated
+selections — 25 across the PostgreSQL suites without a URL, 10 live-container
+tests without a runtime, and the rest of that kind; none of them is an HTTP or
+capability test.
 
 GitHub Actions run **40172988124** for commit `704fb7c` (the `40001 → 25P02`
 chain) — **success**, all four jobs green: `Backend tests (pytest)` 672 passed /
