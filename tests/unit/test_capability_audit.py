@@ -11,6 +11,7 @@ Network-dependent tests skip honestly when no outbound connectivity exists.
 import asyncio
 import atexit
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -136,30 +137,216 @@ def test_python_exec_hanging_code_killed(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 8. HTTP — REAL allowlisted GET; IP-literal and unlisted hosts denied
+# 8. HTTP — allowlisted GET, honest verdicts, no redirect escape
 # ---------------------------------------------------------------------------
+#
+# The policy/response tests run offline against a controlled transport. That is
+# the closest a test can get to a real request here: production requires https
+# on the scheme's default port and refuses every non-global resolved address,
+# so a loopback server is unreachable by design (a local fixture would have to
+# weaken exactly the guard under test). Only the transport is substituted; the
+# allowlist, the DNS/SSRF consult, redirect re-validation, status/content-type
+# handling and body parsing are the production code paths.
+#
+# The single live test keeps the real socket and DNS path, and asserts only the
+# property this repository owns: an allowlisted host gets through the whole
+# policy stack and the adapter reports the far end's own verdict. A third
+# party's 5xx is not a regression here and must not turn the suite red.
 
 
 def _net_ok() -> bool:
+    """Reachability probe — deliberately not an HTTP-status check.
+
+    Probing for a 200 conflated "the internet works" with "example.com is
+    healthy right now": a 503 does not raise, so the old probe returned True
+    and the caller then failed on the status assertion.
+    """
+    import socket
+
     try:
-        httpx.get("https://example.com", timeout=5)
-        return True
-    except Exception:  # noqa: BLE001
+        with socket.create_connection(("example.com", 443), timeout=5):
+            return True
+    except OSError:
         return False
 
 
+def _stub_public_dns(monkeypatch, allowed: bool = True):
+    """Answer the SSRF/DNS consult; return the hosts it was asked about.
+
+    Resolution is the one production step a controlled fixture cannot own, so
+    it is substituted explicitly — and still asserted to be consulted for
+    every hop, which is what keeps an allowlisted name from skipping the guard.
+    """
+    import integrations.adapters.http_get as http_get
+
+    calls: list[str] = []
+
+    def _all_ips_global(host: str):
+        calls.append(host)
+        if allowed:
+            return True, ""
+        return False, f"Refusing non-public resolved address for host '{host}' (SSRF guard)"
+
+    monkeypatch.setattr(http_get, "_all_ips_global", _all_ips_global)
+    return calls
+
+
+def _http_transport(monkeypatch, respond):
+    """Point the adapter's real httpx client at ``respond``; return requested URLs."""
+    import integrations.adapters.http_get as http_get
+
+    seen: list[str] = []
+    real_client = httpx.AsyncClient
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return respond(request)
+
+    transport = httpx.MockTransport(_handler)
+
+    def _client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(http_get.httpx, "AsyncClient", _client)
+    return seen
+
+
 def test_http_allowlisted_host_is_real(tmp_path):
+    """A live allowlisted GET completes and its verdict is the server's own."""
     from integrations.adapters.http_get import HttpGetAdapter
 
     if not _net_ok():
         pytest.skip("no outbound network connectivity")
     h = HttpGetAdapter()
-    r = _run(h, {"url": "https://example.com"})
+
+    # The real allowlist + SSRF guard decide admission before any byte is sent.
+    admitted, reason = h._check_url("https://example.com/")
+    assert admitted, f"allowlisted host refused by policy: {reason}"
+
+    r = _run(h, {"url": "https://example.com/"})
+    if r.success:
+        out = r.output or {}
+        assert out.get("status") == 200
+        assert out.get("operation") == "web_read"
+        assert "example" in str(out.get("title", "")).lower() or (
+            len(str(out.get("content", ""))) > 50
+        )
+        return
+
+    # A real response arrived but was not a success: the adapter must surface
+    # the far end's status verbatim. Fabricating success, or failing without
+    # an HTTP verdict, is what this assertion catches.
+    error = r.error or ""
+    match = re.fullmatch(r"HTTP (\d{3}) from https://example\.com/", error)
+    assert match, f"live GET produced no HTTP verdict: {error!r}"
+    status = int(match.group(1))
+    assert 400 <= status <= 599, f"unexpected non-200 success-path status {status}"
+    assert r.output is None, "a non-200 response must not yield output"
+    # The request left the process and the far end answered with an error. The
+    # happy path is pinned by the fixture tests below, so a third party's 5xx is
+    # reported here rather than treated as this repository's regression.
+
+
+def test_http_read_parses_a_real_200_response(monkeypatch):
+    """Admission, status, title and body come from the actual response bytes."""
+    from integrations.adapters.http_get import HttpGetAdapter
+
+    dns = _stub_public_dns(monkeypatch)
+    body = b"".join(
+        [
+            b"<html><head><title>Example Domain</title></head><body>",
+            b"<h1>Example Domain</h1><p>",
+            b"This domain is for use in documentation examples. " * 3,
+            b"</p></body></html>",
+        ]
+    )
+    seen = _http_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/html; charset=utf-8"}, content=body
+        ),
+    )
+
+    r = _run(HttpGetAdapter(), {"url": "https://example.com/"})
     assert r.success, r.error
     out = r.output or {}
-    assert out.get("status") == 200
-    assert "example" in str(out.get("title", "")).lower() or (
-        len(str(out.get("body", ""))) > 50
+    assert out["status"] == 200
+    assert out["operation"] == "web_read"
+    assert out["title"] == "Example Domain"
+    assert out["content_type"].startswith("text/html")
+    assert "documentation examples" in out["content"]
+    assert out["bytes"] == len(out["content"])
+    # The allowlist did not short-circuit the guard: DNS is consulted on
+    # admission and again for every hop before the request is issued.
+    assert dns and set(dns) == {"example.com"}, dns
+    assert seen == ["https://example.com/"]
+
+
+def test_http_read_refuses_a_host_whose_resolution_is_not_public(monkeypatch):
+    """An allowlisted name does not bypass the SSRF guard's verdict."""
+    from integrations.adapters.http_get import HttpGetAdapter
+
+    _stub_public_dns(monkeypatch, allowed=False)
+    seen = _http_transport(
+        monkeypatch, lambda request: httpx.Response(200, text="must not be sent")
+    )
+
+    r = _run(HttpGetAdapter(), {"url": "https://example.com/"})
+    assert not r.success
+    assert "SSRF" in (r.error or "")
+    assert seen == [], "no request may be sent for a non-public resolution"
+
+
+def test_http_read_non_200_is_a_failure_not_a_success(monkeypatch):
+    """An arbitrary HTTP error is never converted into success."""
+    from integrations.adapters.http_get import HttpGetAdapter
+
+    _stub_public_dns(monkeypatch)
+    _http_transport(
+        monkeypatch, lambda request: httpx.Response(503, text="service unavailable")
+    )
+
+    r = _run(HttpGetAdapter(), {"url": "https://example.com/"})
+    assert not r.success
+    assert r.output is None
+    assert "HTTP 503" in (r.error or "")
+
+
+def test_http_read_refuses_non_text_content_type(monkeypatch):
+    """A 200 is not enough: non-text payloads are refused."""
+    from integrations.adapters.http_get import HttpGetAdapter
+
+    _stub_public_dns(monkeypatch)
+    _http_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, headers={"content-type": "application/octet-stream"}, content=b"\x00" * 64
+        ),
+    )
+
+    r = _run(HttpGetAdapter(), {"url": "https://example.com/"})
+    assert not r.success
+    assert "non-text" in (r.error or "").lower()
+
+
+def test_http_read_does_not_follow_a_redirect_out_of_the_allowlist(monkeypatch):
+    """An allowlisted origin cannot redirect the adapter to another host."""
+    from integrations.adapters.http_get import HttpGetAdapter
+
+    _stub_public_dns(monkeypatch)
+    seen = _http_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            302, headers={"location": "https://evil.example.org/steal"}
+        ),
+    )
+
+    r = _run(HttpGetAdapter(), {"url": "https://example.com/"})
+    assert not r.success
+    assert "allowlist" in (r.error or "").lower()
+    assert seen == ["https://example.com/"], (
+        "the unapproved redirect target must never be fetched"
     )
 
 
