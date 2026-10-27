@@ -580,6 +580,65 @@ selections — 25 across the PostgreSQL suites without a URL, 10 live-container
 tests without a runtime, and the rest of that kind; none of them is an HTTP or
 capability test.
 
+**The sibling live tests, hardened the same way (commit `04c9500`).** The same
+defect remained in `test_http_adapter.py`, which is what the capability-audit
+report flagged as the outstanding exposure: three `network`-marked adapter tests
+asserted `status == 200` from `example.com` and Wikipedia, so a remote 5xx would
+fail CI while the adapter had behaved correctly. A fourth,
+`test_non_allowlisted_domain_rejected_before_any_request`, carried the marker
+without making any request — it was mislabelled, and the rejection happens before
+DNS, so it needs no network at all.
+
+Response handling is now pinned offline through the registry (kernel gate
+included), with only the transport and the DNS consult substituted: a 200 read
+parsed into status/url/title/content/bytes with the guard shown to be consulted;
+`max_chars` truncating the body while `bytes` still reports the full size; a 503
+surfacing as a failure with no output; a `200` with a non-text content type
+refused; a redirect to a non-allowlisted host refused with the target never
+fetched; the non-allowlisted host proven to send nothing at all; and `web_search`
+parsing a real API payload (titles, percent-encoded query, tag-stripped snippets,
+`total_hits`), clamping an oversized `max_results` to 20, failing cleanly on
+non-JSON, and reporting a remote `429`. Nine new tests take the file from 19 to
+28 with no skips.
+
+The three live tests remain, still marked `network`, and the execution policy is
+explicit: CI does not deselect the marker, so they run on every push, and they
+are the only evidence here about public DNS, TLS and Internet reachability. They
+assert only the verdict this repository owns — a 200 with parsed content, or the
+far end's own status surfaced verbatim — and skip with a stated reason when the
+host is unreachable, so the suite is never red because example.com had a bad
+minute. A fabricated success still fails, and so does a failure with no HTTP
+verdict.
+
+GitHub Actions run **40466842138** for commit `04c9500` — **success on the first
+attempt**, all five jobs green: `Backend tests (pytest)` **686 passed / 57
+skipped / 0 failed** (743 collected) and **686 passed / 53 skipped / 4 deselected**
+(the nine new tests account for 677 → 686, and the skip count is unchanged at 57,
+so the live HTTP tests ran rather than skipping); both PostgreSQL gates **27
+passed, 0 skipped** (the pinned job again printing `server_version = 16.9`);
+`Container sandbox gate (live Docker)` green; `Frontend (typecheck + build)`
+green.
+
+Locally on that commit: `test_http_adapter.py` **28 passed, 0 skipped** over
+**10 of 10** consecutive runs, `test_http_adapter.py` + `test_capability_audit.py`
+together **47 passed, 0 skipped**, and the `-m network` selection is exactly the
+three live tests (3 passed). The live tests were also driven by hand through
+three cases: a real-shaped 503 (passes, verdict asserted), a fabricated 200 with
+the wrong body (fails), and no connectivity (skips with a reason).
+
+The full local backend suite on that commit gave **667 passed, 76 skipped, 0
+failed** in 9:28 (exit 0) — 658 plus the nine new tests. One run of the same
+command earlier reported a single failure,
+`test_llm_dod.py::test_exhausted_wrong_llm_module_fails` (`assert 10 == 12` on its LLM-call
+counter, with `recovery_attempts == 3` already satisfied). It did not reproduce:
+the identical command re-run was green, the test passed 3/3 in isolation and 3/3
+with the new HTTP tests ahead of it in the same process, and CI — which runs it
+in both backend steps — passed it. It is a CPU-load-sensitive count assertion in
+a test this change does not touch (its own docstring already notes full-suite
+load sensitivity), and the same file's `test_recovery_regenerates_wrong_llm_module`
+is already recorded above as an intermittent test. It is disclosed here rather
+than papered over or widened out of scope.
+
 GitHub Actions run **40172988124** for commit `704fb7c` (the `40001 → 25P02`
 chain) — **success**, all four jobs green: `Backend tests (pytest)` 672 passed /
 57 skipped / 0 failed (729 collected), and 672 passed / 53 skipped / 4
