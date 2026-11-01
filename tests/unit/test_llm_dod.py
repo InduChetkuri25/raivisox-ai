@@ -147,6 +147,99 @@ def _audit_count(action: str, actor_id: str) -> int:
     return len(AuditTrail.instance().get_events(action=action, actor_id=actor_id))
 
 
+CODEGEN_NODES = ("step-5", "step-6", "step-7")
+
+
+def _track_attempts(monkeypatch, calls: list[dict]) -> list[dict]:
+    """Record, per pipeline attempt, real codegen and LLM work.
+
+    The pipeline's recovery budget is shared: an incidental step failure
+    (e.g. a solve probe timing out on a loaded machine) sends one attempt
+    down the verification-failure path, which re-arms ONLY the failed
+    branch — so a run can legitimately execute fewer than 12 codegen nodes
+    while still exhausting all 3 recovery attempts. Counting calls per
+    attempt, and pairing each attempt with the DoD re-arm that preceded it,
+    lets the tests assert the real guarantee (one LLM consultation per
+    codegen execution, all modules regenerated on every DoD recovery)
+    instead of an incidental pass composition.
+
+    Both counters are real: `tool:codegen` is what the security kernel
+    audits before every adapter invocation, and `calls` is what the stubbed
+    LLM transport actually received.
+    """
+    from app import main as app_main
+    from app.main import PIPELINE_ACTOR
+    from services.execution.task_graph import ParallelExecutor
+
+    attempts: list[dict] = []
+    pending_rearm: list[list[str]] = []
+    original_execute = ParallelExecutor.execute
+    original_reset = app_main._reset_codegen_nodes
+
+    def reset_codegen_nodes(graph, decomposed):
+        rearmed = original_reset(graph, decomposed)
+        pending_rearm.append(list(rearmed))
+        return rearmed
+
+    async def execute(self):
+        before_calls = len(calls)
+        before_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
+        rearms = list(pending_rearm)
+        pending_rearm.clear()
+        try:
+            return await original_execute(self)
+        finally:
+            attempts.append(
+                {
+                    "llm_calls": len(calls) - before_calls,
+                    "codegen_invocations": _audit_count("tool:codegen", PIPELINE_ACTOR)
+                    - before_cg,
+                    "rearmed_before": rearms,
+                }
+            )
+
+    monkeypatch.setattr(app_main, "_reset_codegen_nodes", reset_codegen_nodes)
+    monkeypatch.setattr(ParallelExecutor, "execute", execute)
+    return attempts
+
+
+def _assert_exhausted_recovery_consulted_llm(
+    body: dict, calls: list[dict], attempts: list[dict], pre_cg: int
+) -> None:
+    """Shared guarantees for the exhausted-recovery scenario."""
+    from app.main import PIPELINE_ACTOR
+
+    # Never falsely successful, and recovery really ran until exhausted.
+    assert body["status"] == "failed"
+    assert body["definition_of_done"]["satisfied"] is False
+    assert body["result"]["definition_of_done"]["satisfied"] is False
+    assert body["result"]["recovery_attempts"] == 3
+
+    # One attempt per recovery attempt, plus the initial pass.
+    assert len(attempts) == body["result"]["recovery_attempts"] + 1
+
+    # Every codegen execution consulted the LLM exactly once: no call is
+    # silently omitted and none is double-counted.
+    for i, attempt in enumerate(attempts, 1):
+        assert attempt["codegen_invocations"] > 0, (i, attempt)
+        assert attempt["llm_calls"] == attempt["codegen_invocations"], (i, attempt)
+
+    # The initial attempt generated all three modules from the LLM.
+    assert attempts[0]["llm_calls"] == 3, attempts[0]
+
+    # Every DoD-driven regeneration re-armed ALL three codegen nodes (never a
+    # silent subset) and re-consulted the LLM for each of them.
+    regenerations = [a for a in attempts[1:] if a["rearmed_before"]]
+    assert regenerations
+    for attempt in regenerations:
+        assert set(CODEGEN_NODES) <= set(attempt["rearmed_before"][0]), attempt
+        assert attempt["codegen_invocations"] == 3, attempt
+        assert attempt["llm_calls"] == 3, attempt
+
+    # Whole-run cross-check against the kernel's own audit count.
+    assert len(calls) == _audit_count("tool:codegen", PIPELINE_ACTOR) - pre_cg
+
+
 # ---------------------------------------------------------------------------
 # A. Requirement 1 — the LLM receives the actual task GOAL, not the title
 # ---------------------------------------------------------------------------
@@ -173,6 +266,10 @@ def test_llm_receives_goal_not_title(client, monkeypatch):
     calls = _install_llm_stub(monkeypatch, [SUM_OK])
     _enable_llm(monkeypatch, _pipeline_codegen_adapter())
 
+    from app.main import PIPELINE_ACTOR
+
+    pre_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
+
     r = client.post(
         "/api/v1/tasks",
         json={"title": TITLE_DISTRACTOR, "goal": GOAL_SUM},
@@ -193,8 +290,14 @@ def test_llm_receives_goal_not_title(client, monkeypatch):
         assert m["executed"] is True
         assert m["execution_output"] == 5050
 
-    # Every codegen step (5, 6, 7) consulted the LLM.
-    assert len(calls) == 3
+    # Every codegen step (5, 6, 7) consulted the LLM — one consultation per
+    # codegen execution, taken from the kernel's own audit count rather than
+    # a hard-coded 3. The initial pass always executes all three nodes, so a
+    # silent skip still fails here (3 is the floor); an incidental probe
+    # failure on a loaded machine re-arms just that node and legitimately
+    # adds a call, which is not what this test is about.
+    assert len(calls) >= 3
+    assert len(calls) == _audit_count("tool:codegen", PIPELINE_ACTOR) - pre_cg
     for req in calls:
         user_msg = req["messages"][1]["content"]
         assert "sum of all integers from 1 to 100" in user_msg
@@ -405,6 +508,7 @@ def test_exhausted_wrong_llm_module_fails(client, monkeypatch):
 
     from app.main import PIPELINE_ACTOR
 
+    attempts = _track_attempts(monkeypatch, calls)
     pre_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
 
     r = client.post(
@@ -423,15 +527,80 @@ def test_exhausted_wrong_llm_module_fails(client, monkeypatch):
     # (No verdict assertion here: under full-suite CPU load a solve probe
     # can transiently time out and degrade the execution verdict, which
     # is not what this test verifies. The DoD/recovery/status assertions
-    # below are the subject, and the audit counts prove the codegen nodes
-    # really did run every pass.)
-    assert body["definition_of_done"]["satisfied"] is False
-    assert body["result"]["definition_of_done"]["satisfied"] is False
-    assert body["status"] == "failed"
-    assert body["result"]["recovery_attempts"] == 3
+    # are the subject, and the audit counts prove the codegen nodes really
+    # did run every pass.)
+    #
+    # The exact total is deliberately NOT hard-coded: on a loaded machine an
+    # incidental step failure spends one of the 3 recovery attempts on the
+    # verification-failure path, which re-arms only the failed branch (see
+    # `test_incidental_step_failure_still_exhausts_recovery`). What must
+    # hold in every such run is one LLM consultation per codegen execution
+    # and a full three-module regeneration on every DoD recovery.
+    _assert_exhausted_recovery_consulted_llm(body, calls, attempts, pre_cg)
 
-    # Regeneration really re-consulted the LLM each attempt:
-    # 3 codegen steps x (initial + 3 recoveries) = 12 calls.
-    assert len(calls) == 12
-    post_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
-    assert post_cg - pre_cg == 12
+
+def test_incidental_step_failure_still_exhausts_recovery(client, monkeypatch):
+    """A load-induced codegen failure must not change what we guarantee.
+
+    Regression for the flake where this scenario occasionally made 10 LLM
+    calls instead of 12 while `recovery_attempts == 3` still held. One
+    codegen step's real solve probe fails transiently AFTER the LLM has
+    been consulted (what a probe timeout / sandbox spawn failure looks
+    like under CPU load). The pipeline then spends one recovery attempt on
+    the verification-failure path, which re-arms only that node, so the
+    run legitimately executes fewer than the clean 12 codegen nodes — the
+    assertion must still prove exhausted recovery, per-execution LLM
+    consultation, and full regeneration on every DoD attempt.
+    """
+    from integrations.adapters.codegen import CodegenAdapter
+
+    calls = _install_llm_stub(monkeypatch, [SUM_BUGGY])  # always wrong
+    _enable_llm(monkeypatch, _pipeline_codegen_adapter())
+
+    from app.main import PIPELINE_ACTOR
+
+    attempts = _track_attempts(monkeypatch, calls)
+    pre_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
+
+    original_probe = CodegenAdapter._solve_probe
+    probe_calls = {"n": 0}
+
+    async def flaky_probe(self, *args, **kwargs):
+        probe_calls["n"] += 1
+        if probe_calls["n"] == 1:
+            # Honest sandbox/spawn failure: the module was never verified.
+            return {
+                "ran": False,
+                "stderr": "sandbox unavailable (simulated probe failure)",
+                "exit_code": None,
+                "stdout": "",
+            }
+        return await original_probe(self, *args, **kwargs)
+
+    monkeypatch.setattr(CodegenAdapter, "_solve_probe", flaky_probe)
+
+    r = client.post(
+        "/api/v1/tasks",
+        json={"title": TITLE_DISTRACTOR, "goal": GOAL_SUM},
+    )
+    assert r.status_code == 201, r.text
+    task_id = r.json()["id"]
+
+    r = client.post(f"/api/v1/tasks/{task_id}/execute", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # The incidental failure really landed: the failed codegen node was
+    # retried, and at least one attempt re-ran only that branch, so this run
+    # executed fewer codegen nodes than the clean 12.
+    #
+    # The exact composition is deliberately NOT asserted. On this machine the
+    # injected failure gives [3, 1, 3, 3], but a full-suite run under load can
+    # hit a SECOND incidental failure and spend another attempt the same way
+    # ([3, 1, 3, 1] was observed). Both are legitimate; pinning either one
+    # would only reintroduce the load-sensitive assertion this test replaces.
+    assert probe_calls["n"] >= 2, probe_calls
+    assert any(a["codegen_invocations"] < 3 for a in attempts[1:]), attempts
+    assert len(calls) < 12
+
+    _assert_exhausted_recovery_consulted_llm(body, calls, attempts, pre_cg)
