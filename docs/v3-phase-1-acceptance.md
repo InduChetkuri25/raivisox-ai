@@ -506,6 +506,64 @@ Nothing here is a human approval of those gates.
 
 ## 11. CI and delivery
 
+**The load-sensitive LLM-call count in the DoD recovery test, fixed at the
+cause (commit `03bc703`).** `test_llm_dod.py::test_exhausted_wrong_llm_module_fails`
+occasionally asserted 10 LLM calls instead of 12 while `recovery_attempts == 3`
+already held. The counter was right; the hard-coded total was wrong. The
+pipeline's recovery budget is shared: if any step fails during a pass
+(typically a code-generation solve probe timing out while the machine is
+saturated by the rest of the suite), that pass ends on the
+*verification-failure* path instead of the DoD path, and `_reset_for_retry`
+re-arms only the failed node. The next pass therefore executes one codegen
+node rather than three, one of the three recovery attempts is spent there, and
+the run legitimately performs 10 consultations — same number of attempts, each
+codegen execution still consulting the LLM exactly once. No retry or recovery
+defect was involved, and no production code was changed.
+
+The tests now assert the guarantee instead of the pass shape. A helper records
+every attempt and, per attempt, the kernel's `tool:codegen` audit delta (what
+was really executed) beside the stubbed transport's received calls (what the
+LLM was really asked), then asserts: the task ends failed with
+`recovery_attempts == 3` and DoD unsatisfied; attempts = recoveries + 1; every
+attempt ran at least one codegen node and its LLM calls equal its codegen
+executions (nothing silently omitted or double-counted); the first attempt
+generated all three modules; and every DoD-driven regeneration re-armed all
+three codegen nodes and re-consulted the LLM for each. A new deterministic
+test (`test_incidental_step_failure_still_exhausts_recovery`) injects exactly
+the load-shaped failure — one probe returning `ran: False` after the LLM was
+consulted — and asserts those same guarantees plus that the failed node was
+retried and some pass ran a single node, without pinning which composition
+results (this machine produces `[3, 1, 3, 3]`; a full-suite run under real
+load produced `[3, 1, 3, 1]`, both legitimate — that difference is why the
+shape is not asserted). `test_llm_receives_goal_not_title` carried the same
+brittleness (`assert len(calls) == 3`) and failed the same way in a full-suite
+run (`assert 4 == 3`); it now requires at least three consultations, one per
+codegen execution according to the audit count, and still checks the actual
+subject — the goal, not the title, reaches every prompt. Neither test was
+skipped, relaxed, retried or marked non-blocking.
+
+Evidence, all local unless marked CI. `test_llm_dod.py` **9 passed** on **10 of
+10** consecutive runs, and **15 of 15** more with three pytest processes in
+parallel for five rounds while CPU hogs saturated every core. Mutation checks
+confirm the assertions still bite: re-arming only one codegen node after a DoD
+failure fails 3 tests in the file, and cutting the recovery budget from 3 to 1
+fails 2. The full backend suite (`pytest tests -q -m "not live_llm"`) gave
+**668 passed, 72 skipped, 4 deselected, 0 failed** in 6:52. Two earlier
+full-suite runs on this same work surfaced the second failure shape
+(`[3, 1, 3, 1]` and `assert 4 == 3`) — both fixed above rather than re-run away.
+
+GitHub Actions run **41283818265** for commit `03bc703` — **success**, all five
+jobs green: `Backend tests (pytest)` **687 passed / 57 skipped / 0 failed** and
+**687 passed / 53 skipped / 4 deselected** for the explicit `-m "not live_llm"`
+selection; `PostgreSQL gate (real server)` and `PostgreSQL gate (16.9, pinned)`
+**27 passed, 0 skipped** each, the pinned job again printing
+`server_version = 16.9 (Debian 16.9-1.pgdg130+1)` read from the running server
+before any test; `Container sandbox gate (live Docker)` 19 live passed /
+0 skipped plus 64 passed / 3 skipped in the non-live half; `Frontend (typecheck
++ build)` typecheck clean and `Compiled successfully`. CI evidence is the green
+run above; everything else in this section was run locally on Windows/Python
+3.12.2.
+
 GitHub Actions run **40182067467** for commit `ddb83da` (the pinned 16.9 gate)
 — **success** on re-run, all five jobs green: `Backend tests (pytest)` 672
 passed / 57 skipped / 0 failed (729 collected), and 672 passed / 53 skipped / 4
@@ -637,7 +695,8 @@ in both backend steps — passed it. It is a CPU-load-sensitive count assertion 
 a test this change does not touch (its own docstring already notes full-suite
 load sensitivity), and the same file's `test_recovery_regenerates_wrong_llm_module`
 is already recorded above as an intermittent test. It is disclosed here rather
-than papered over or widened out of scope.
+than papered over or widened out of scope. It was subsequently root-caused and
+fixed at the assertion — see the `03bc703` entry in §11.
 
 GitHub Actions run **40172988124** for commit `704fb7c` (the `40001 → 25P02`
 chain) — **success**, all four jobs green: `Backend tests (pytest)` 672 passed /
@@ -704,7 +763,9 @@ the non-live half), `Frontend (typecheck + build)`.
   25P02 is refused, not retried, against real PostgreSQL`) and `704fb7c`
   (`test(v3): prove one real 40001 → 25P02 chain retries only its cause`), plus
   `ddb83da` (`ci(v3): gate PostgreSQL 16.9 by version and record the parity
-  run`), all pushed to `origin/main`.
+  run`), all pushed to `origin/main`, followed by `8568810`, `04c9500` and
+  `03bc703` (`test(v3): assert the DoD recovery guarantee, not the pass
+  composition`) after the release.
 - `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
   started.
 - Working tree clean after the documentation commit that records this report.
