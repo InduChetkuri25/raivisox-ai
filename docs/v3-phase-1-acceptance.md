@@ -552,6 +552,14 @@ fails 2. The full backend suite (`pytest tests -q -m "not live_llm"`) gave
 full-suite runs on this same work surfaced the second failure shape
 (`[3, 1, 3, 1]` and `assert 4 == 3`) — both fixed above rather than re-run away.
 
+The same file still pins one exact total: `test_recovery_regenerates_wrong_llm_module`
+asserts `len(calls) == 6` (3 initial + 3 regenerated). It was not touched here —
+it carries that test's own subject (exactly one full regeneration after a DoD
+failure) and no run has failed on it, so rewriting it without an observed
+failure would have been an unrequested change to a neighbouring guarantee. It
+remains exposed to the same load-shaped mechanism if an incidental step failure
+lands in one of its two passes, and is disclosed rather than claimed fixed.
+
 GitHub Actions run **41283818265** for commit `03bc703` — **success**, all five
 jobs green: `Backend tests (pytest)` **687 passed / 57 skipped / 0 failed** and
 **687 passed / 53 skipped / 4 deselected** for the explicit `-m "not live_llm"`
