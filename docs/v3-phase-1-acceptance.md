@@ -506,6 +506,64 @@ Nothing here is a human approval of those gates.
 
 ## 11. CI and delivery
 
+**The last exact LLM-call total in the DoD recovery tests, fixed at the
+cause (commit `1a12bad`).** `test_llm_dod.py::test_recovery_regenerates_wrong_llm_module`
+asserted `len(calls) == 6` (three codegen nodes x two passes: the wrong
+generation, then the DoD-driven regeneration). Six is not an invariant — and
+unlike the `03bc703` case it was not merely a brittle assertion: the same
+call-order-keyed stub also made the test's own subject disappear under load.
+Measured against the production pipeline with only the LLM transport stubbed,
+a single transient solve-probe failure — injected exactly as CPU load
+produces it — gives **4 calls** when it lands in the initial pass and **7**
+when it lands in the regeneration pass. In the first case the branch-only
+retry re-runs one codegen node, and because the stub answered by call order
+(`per_pass=3`) that retried node received the "correct" module, so the DoD
+passed and the run finished successfully with `recovery_attempts == 1` — the
+DoD regeneration the test exists to verify never ran at all. In the second
+case `recovery_attempts` became 2. So `assert len(calls) == 6` failed in both
+shapes, and `recovery_attempts == 1` failed in the second: a false red, and
+in the first shape a false green for the test's actual subject.
+
+The fix is in the fixture and the assertions, not in production. The stub is
+now keyed to the pipeline's DoD re-arm (`_install_llm_stub_until_dod_recovery`,
+plus an `on_dod_rearm` hook on the attempt recorder): it serves the wrong
+module until `_reset_codegen_nodes` actually runs on the DoD-failure path, and
+the corrected module afterwards. The initial pass is therefore wrong for all
+three codegen nodes however the passes are scheduled, a branch-only retry
+cannot accidentally satisfy the DoD, and the regeneration is always
+exercised. The test now asserts, per execution: the run ends `completed` with
+the DoD satisfied, `5050` from every module, a passed verdict and all steps
+completed; the stub's `recovered` flag is set, so recovery was genuinely
+required and this is never a spurious success;
+`len(attempts) == recovery_attempts + 1`; the initial attempt ran all three
+codegen nodes with three LLM consultations; **every DoD-driven re-arm
+re-armed all three codegen nodes and the following attempt made exactly three
+codegen invocations and three LLM calls** — never a silent subset, never a
+reused module; every attempt consulted the LLM once per codegen execution
+(nothing omitted, nothing double-counted); the two `fs_write` nodes still ran
+exactly once, so completed independent nodes are never re-executed by
+recovery; and the whole-run call count equals the kernel's `tool:codegen`
+audit delta. No call total is pinned. Nothing was skipped, relaxed, retried or
+marked non-blocking, and the outcome, DoD, verdict, step and `fs_write`
+assertions are unchanged.
+
+Evidence, local unless marked CI: `test_llm_dod.py` **9 passed** on **10 of 10**
+consecutive runs, and **15 of 15** more with three pytest processes in
+parallel for five rounds while CPU hogs saturated every core. Mutation checks
+still bite: making DoD recovery re-arm only one codegen node fails 3 tests in
+the file, and making the adapter reuse its first generation instead of
+re-consulting the LLM (a silently omitted consultation) fails 3. The full
+backend suite (`pytest tests -q -m "not live_llm"`) gave **668 passed,
+72 skipped, 4 deselected, 0 failed** in 7:16. GitHub Actions run
+**43888623506** for commit `1a12bad` — **success**, all five jobs green:
+`Backend tests (pytest)` **687 passed / 57 skipped / 0 failed** and
+**687 passed / 53 skipped / 4 deselected**; `PostgreSQL gate (real server)` and
+`PostgreSQL gate (16.9, pinned)` **27 passed, 0 skipped** each, the pinned job
+again printing `server_version = 16.9 (Debian 16.9-1.pgdg130+1)` read from the
+running server; `Container sandbox gate (live Docker)` 19 live passed /
+0 skipped plus 64 passed / 3 skipped; `Frontend (typecheck + build)` typecheck
+clean and `Compiled successfully`.
+
 **The load-sensitive LLM-call count in the DoD recovery test, fixed at the
 cause (commit `03bc703`).** `test_llm_dod.py::test_exhausted_wrong_llm_module_fails`
 occasionally asserted 10 LLM calls instead of 12 while `recovery_attempts == 3`
@@ -552,13 +610,15 @@ fails 2. The full backend suite (`pytest tests -q -m "not live_llm"`) gave
 full-suite runs on this same work surfaced the second failure shape
 (`[3, 1, 3, 1]` and `assert 4 == 3`) — both fixed above rather than re-run away.
 
-The same file still pins one exact total: `test_recovery_regenerates_wrong_llm_module`
-asserts `len(calls) == 6` (3 initial + 3 regenerated). It was not touched here —
-it carries that test's own subject (exactly one full regeneration after a DoD
-failure) and no run has failed on it, so rewriting it without an observed
-failure would have been an unrequested change to a neighbouring guarantee. It
-remains exposed to the same load-shaped mechanism if an incidental step failure
-lands in one of its two passes, and is disclosed rather than claimed fixed.
+The same file then still pinned one exact total:
+`test_recovery_regenerates_wrong_llm_module` asserted `len(calls) == 6`
+(3 initial + 3 regenerated). It was left untouched at the time because no run
+had failed on it and rewriting it without an observed failure would have been
+an unrequested change to a neighbouring guarantee. It was subsequently
+reviewed with injected load-shaped failures, which showed that six is not an
+invariant (4 and 7 were measured) and that the call-order-keyed stub could
+satisfy the DoD without running the regeneration at all — fixed in `1a12bad`,
+see the entry at the top of this section.
 
 GitHub Actions run **41283818265** for commit `03bc703` — **success**, all five
 jobs green: `Backend tests (pytest)` **687 passed / 57 skipped / 0 failed** and
@@ -773,7 +833,8 @@ the non-live half), `Frontend (typecheck + build)`.
   `ddb83da` (`ci(v3): gate PostgreSQL 16.9 by version and record the parity
   run`), all pushed to `origin/main`, followed by `8568810`, `04c9500` and
   `03bc703` (`test(v3): assert the DoD recovery guarantee, not the pass
-  composition`) after the release.
+  composition`) and `1a12bad` (`test(v3): assert the DoD regeneration
+  guarantee, not the call total`) after the release.
 - `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
   started.
 - Working tree clean after the documentation commit that records this report.
