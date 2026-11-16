@@ -114,6 +114,58 @@ def _install_llm_stub(monkeypatch, codes: list[str], per_pass: int = 3) -> list[
     return calls
 
 
+def _install_llm_stub_until_dod_recovery(
+    monkeypatch, wrong: str, corrected: str
+) -> tuple[list[dict], dict]:
+    """Stub the LLM with a model that answers WRONG until it is re-prompted
+    after a DoD failure, and RIGHT afterwards.
+
+    `_install_llm_stub` groups responses by CALL ORDER (`per_pass`), which
+    couples a recovery test to the pass composition: a transient probe
+    failure spends a recovery attempt on the branch-only retry path, and the
+    single retried node then consumes the "correct" response — so the DoD
+    passes without the regeneration the test exists to verify (measured: 4
+    calls instead of 6). Keying the answer to the pipeline's DoD re-arm
+    instead keeps the initial pass wrong for all three codegen nodes however
+    the passes are scheduled, so the regeneration is always exercised.
+
+    Returns the captured request bodies and a state dict whose `recovered`
+    flag flips when the pipeline re-arms codegen for a DoD failure.
+    """
+    calls: list[dict] = []
+    state = {"recovered": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content.decode("utf-8")))
+        code = corrected if state["recovered"] else wrong
+        return httpx.Response(
+            200,
+            json={
+                "id": "stub",
+                "object": "chat.completion",
+                "model": "stub-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": f"```python\n{code}\n```",
+                        },
+                    }
+                ],
+            },
+        )
+
+    class _StubClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _StubClient)
+    return calls, state
+
+
 def _enable_llm(monkeypatch, instance: CodegenAdapter) -> None:
     """Flip an adapter instance (fresh or the pipeline singleton) to LLM mode.
 
@@ -150,7 +202,7 @@ def _audit_count(action: str, actor_id: str) -> int:
 CODEGEN_NODES = ("step-5", "step-6", "step-7")
 
 
-def _track_attempts(monkeypatch, calls: list[dict]) -> list[dict]:
+def _track_attempts(monkeypatch, calls: list[dict], on_dod_rearm=None) -> list[dict]:
     """Record, per pipeline attempt, real codegen and LLM work.
 
     The pipeline's recovery budget is shared: an incidental step failure
@@ -179,6 +231,10 @@ def _track_attempts(monkeypatch, calls: list[dict]) -> list[dict]:
     def reset_codegen_nodes(graph, decomposed):
         rearmed = original_reset(graph, decomposed)
         pending_rearm.append(list(rearmed))
+        if on_dod_rearm is not None:
+            # Lets a stub react to the DoD recovery itself instead of to a
+            # call index (which would couple it to the pass composition).
+            on_dod_rearm(rearmed)
         return rearmed
 
     async def execute(self):
@@ -459,13 +515,21 @@ def test_goal_echo_does_not_fool_dod(tmp_path):
 
 
 def test_recovery_regenerates_wrong_llm_module(client, monkeypatch):
-    # Attempt 1: all three codegen steps get the buggy module; after the
-    # DoD failure and re-arm, the regenerated modules are correct.
-    calls = _install_llm_stub(monkeypatch, [SUM_BUGGY, SUM_OK])
+    """A DoD failure regenerates all three modules and re-consults the LLM.
+
+    Attempt 1: all three codegen steps get the buggy module; after the DoD
+    failure and re-arm, the regenerated modules are correct. The stub's
+    answer is keyed to the DoD re-arm (`_install_llm_stub_until_dod_recovery`),
+    so the regeneration always runs no matter how passes are scheduled.
+    """
+    calls, state = _install_llm_stub_until_dod_recovery(monkeypatch, SUM_BUGGY, SUM_OK)
     _enable_llm(monkeypatch, _pipeline_codegen_adapter())
 
     from app.main import PIPELINE_ACTOR
 
+    attempts = _track_attempts(
+        monkeypatch, calls, on_dod_rearm=lambda _rearmed: state.update(recovered=True)
+    )
     pre_fs = _audit_count("tool:fs_write", PIPELINE_ACTOR)
     pre_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
 
@@ -490,16 +554,46 @@ def test_recovery_regenerates_wrong_llm_module(client, monkeypatch):
     for s in body["steps"]:
         assert s["status"] == "completed"
 
-    # The LLM was genuinely re-consulted: 3 codegen steps x 2 passes.
-    assert len(calls) == 6
+    # The DoD failure really happened and was recovered from: the stub only
+    # switches to correct code when the pipeline re-arms codegen after a DoD
+    # failure, so recovery was genuinely required — never a spurious success.
+    assert state["recovered"] is True
+    assert len(attempts) == body["result"]["recovery_attempts"] + 1
+
+    # The initial pass consulted the LLM once per codegen node and produced
+    # the wrong module, which is what forced the recovery.
+    assert attempts[0]["codegen_invocations"] == 3, attempts[0]
+    assert attempts[0]["llm_calls"] == 3, attempts[0]
+
+    # DoD recovery regenerated ALL three modules: every DoD-driven re-arm
+    # re-armed all three codegen nodes, and the following pass re-consulted
+    # the LLM for each of them — never a silent subset, never a reused module.
+    #
+    # The total number of calls is deliberately NOT asserted (neither the old
+    # `len(calls) == 6` nor the audit total 6). A transient probe failure on a
+    # loaded machine spends a recovery attempt on the branch-only retry path,
+    # which legitimately makes the total 4 or 7; that is pass composition, not
+    # the guarantee. The guarantee is asserted per execution below.
+    regenerations = [a for a in attempts[1:] if a["rearmed_before"]]
+    assert regenerations
+    for attempt in regenerations:
+        assert set(CODEGEN_NODES) <= set(attempt["rearmed_before"][0]), attempt
+        assert attempt["codegen_invocations"] == 3, attempt
+        assert attempt["llm_calls"] == 3, attempt
+
+    # One LLM consultation per codegen execution in every pass: no call is
+    # silently omitted and none is double-counted.
+    for i, attempt in enumerate(attempts, 1):
+        assert attempt["codegen_invocations"] > 0, (i, attempt)
+        assert attempt["llm_calls"] == attempt["codegen_invocations"], (i, attempt)
 
     # Audit counts prove WHO ran: fs_write nodes (steps 4 and 11) ran
-    # exactly once — never re-executed during DoD recovery — while the
-    # 3 codegen nodes ran twice (regenerated).
+    # exactly once — never re-executed during DoD recovery — and every codegen
+    # execution is accounted for by the stub's received calls.
     post_fs = _audit_count("tool:fs_write", PIPELINE_ACTOR)
     post_cg = _audit_count("tool:codegen", PIPELINE_ACTOR)
     assert post_fs - pre_fs == 2
-    assert post_cg - pre_cg == 6
+    assert len(calls) == post_cg - pre_cg
 
 
 def test_exhausted_wrong_llm_module_fails(client, monkeypatch):
