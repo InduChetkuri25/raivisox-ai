@@ -15,7 +15,7 @@ from sqlalchemy import text
 from integrations.adapters import AdapterRegistry, FileWriteAdapter
 from services.security.audit_trail import AuditTrail
 from services.security.security_kernel import Permission, SecurityKernel
-from tests.unit.v3_phase1_helpers import ctx_for, phase1_stack  # noqa: F401
+from tests.unit.v3_phase1_helpers import ctx_for, live_action, phase1_stack  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -322,3 +322,193 @@ async def test_links_never_contain_content_or_secret(stack):
         )
     assert "SECRET" not in dumped
     assert "sk-" not in dumped
+
+
+# ---------------------------------------------------------------------------
+# Adapter refusal paths carry provenance (acceptance-audit finding M1)
+# ---------------------------------------------------------------------------
+# ShellExecAdapter (blocked command), FinalizeAdapter (clamp, quota) and
+# CodegenAdapter (clamp) each write a forensic row for an application-level
+# refusal. Before this fix those calls passed no linkage, so the row existed
+# with no `audit_links` entry even though the trusted context carried the
+# subject. Linkage is evidence only: these tests leave the refusal path, its
+# decision and its details untouched.
+
+_LINK_FIELDS = ("user_id", "task_id", "run_id", "step_node_id", "action_id")
+
+
+async def _linked_rows(stack, action: str) -> list[dict]:
+    """Audit rows for one action, LEFT JOINed with their link columns."""
+    async with stack.factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT a.event_id, a.actor_id, a.action, a.allowed, a.details, "
+                    "l.user_id, l.task_id, l.run_id, l.step_node_id, l.action_id "
+                    "FROM audit_events a "
+                    "LEFT JOIN audit_links l ON l.event_id = a.event_id "
+                    "WHERE a.action = :action ORDER BY a.timestamp, a.id"
+                ),
+                {"action": action},
+            )
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _assert_linked_to(rows, stack, action_id: str) -> None:
+    assert rows, "the refusal must be audited"
+    for row in rows:
+        assert row["user_id"] == stack.user_id
+        assert row["task_id"] == stack.task_id
+        assert row["run_id"] == stack.run_id
+        assert row["step_node_id"] == "step-1"
+        assert row["action_id"] == action_id
+
+
+async def test_shell_exec_blocked_command_audit_row_is_linked(stack, tmp_path):
+    from integrations.adapters.builtin import ShellExecAdapter
+
+    adapter = ShellExecAdapter(str(tmp_path / "shellws"))
+    action_id = live_action()
+    result = await adapter.run(
+        {"command": "definitely-not-an-allowed-command --flag"},
+        ctx_for(stack, action_id=action_id),
+    )
+    # Policy refused it before any process was spawned.
+    assert result.success is False
+
+    assert await _flush(stack) == 1
+    rows = await _linked_rows(stack, "tool:shell_exec")
+    _assert_linked_to(rows, stack, action_id)
+    assert not rows[0]["allowed"]
+    assert "allow list" in json.dumps(rows[0]["details"]).lower()
+
+
+async def test_finalize_clamped_write_audit_row_is_linked(stack, tmp_path):
+    from integrations.adapters import FinalizeAdapter
+
+    kernel = SecurityKernel()
+    kernel.grant_permission("pipeline-service", Permission.WRITE_FILES)
+    registry = AdapterRegistry(kernel)
+    registry.register(FinalizeAdapter(stack.workspace))
+
+    ctx = ctx_for(stack)
+    outside = str(tmp_path / "outside" / "deliverable.md")
+    result = await registry.run("finalize", {"document": "x", "path": outside}, ctx)
+    assert result.success is False
+    assert ctx.action_id, "the registry issues the action id"
+
+    # The kernel's allow and the adapter's clamp refusal, both linked.
+    assert await _flush(stack) == 2
+    rows = await _linked_rows(stack, "tool:finalize")
+    _assert_linked_to(rows, stack, ctx.action_id)
+    assert {bool(row["allowed"]) for row in rows} == {True, False}
+
+    # Graph evidence for the same invocation is unchanged and consistent.
+    async with stack.factory() as session:
+        events = (
+            await session.execute(
+                text(
+                    "SELECT event_type, user_id, task_id, run_id, step_node_id "
+                    "FROM graph_events WHERE action_id = :aid ORDER BY seq"
+                ),
+                {"aid": ctx.action_id},
+            )
+        ).mappings().all()
+    assert "tool.attempted" in {event["event_type"] for event in events}
+    for event in events:
+        assert event["user_id"] == stack.user_id
+        assert event["task_id"] == stack.task_id
+        assert event["run_id"] == stack.run_id
+        assert event["step_node_id"] == "step-1"
+
+
+async def test_finalize_quota_refusal_audit_row_is_linked(stack):
+    from integrations.adapters import FinalizeAdapter
+    from services.execution.workspace_quota import WorkspaceQuota
+
+    adapter = FinalizeAdapter(
+        stack.workspace,
+        quota=WorkspaceQuota(max_total_bytes=16, max_file_bytes=16),
+    )
+    action_id = live_action()
+    result = await adapter.run(
+        {"document": "x" * 128}, ctx_for(stack, action_id=action_id)
+    )
+    assert result.success is False
+    assert "quota" in (result.error or "").lower()
+
+    assert await _flush(stack) == 1
+    _assert_linked_to(await _linked_rows(stack, "tool:finalize"), stack, action_id)
+
+
+async def test_codegen_rejected_path_audit_row_is_linked(stack, tmp_path, monkeypatch):
+    from integrations.adapters import CodegenAdapter
+
+    for var in ("RAIVISOX_LLM_API_KEY", "OPENAI_API_KEY", "RAIVISOX_LLM_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    adapter = CodegenAdapter(stack.workspace)
+    assert adapter._llm_usable is False
+
+    action_id = live_action()
+    outside = str(tmp_path / "outside" / "module.py")
+    result = await adapter.run(
+        {"goal": "audit linkage probe", "path": outside},
+        ctx_for(stack, action_id=action_id),
+    )
+    assert result.success is False
+    assert "outside the workspace" in (result.error or "")
+
+    assert await _flush(stack) == 1
+    _assert_linked_to(await _linked_rows(stack, "tool:codegen"), stack, action_id)
+
+
+async def test_refusal_without_trusted_provenance_creates_no_link(stack, tmp_path):
+    from integrations.adapters import AdapterContext
+    from integrations.adapters.finalize import FinalizeAdapter
+
+    # A legacy caller: no user/task/run/action. Whatever is absent stays None;
+    # nothing is invented to fill the link row.
+    adapter = FinalizeAdapter(stack.workspace)
+    ctx = AdapterContext(actor_id="pipeline-service")
+    result = await adapter.run(
+        {"document": "x", "path": str(tmp_path / "nope.md")}, ctx
+    )
+    assert result.success is False
+
+    assert await _flush(stack) == 1
+    rows = await _linked_rows(stack, "tool:finalize")
+    assert len(rows) == 1
+    for field in _LINK_FIELDS:
+        assert rows[0][field] is None, f"{field} must not be fabricated"
+
+
+async def test_link_failure_rolls_back_newly_linked_adapter_row(stack, tmp_path, monkeypatch):
+    import app.models.audit_link as link_module
+    from integrations.adapters.finalize import FinalizeAdapter
+
+    adapter = FinalizeAdapter(stack.workspace)
+    action_id = live_action()
+    result = await adapter.run(
+        {"document": "x", "path": str(tmp_path / "outside.md")},
+        ctx_for(stack, action_id=action_id),
+    )
+    assert result.success is False
+    assert AuditTrail.instance().pending_count() == 1
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("link insert failed")
+
+    monkeypatch.setattr(link_module, "AuditLink", _boom)
+    with pytest.raises(RuntimeError):
+        await _flush(stack)
+
+    assert await _count(stack, "audit_events") == 0, "no orphan audit row"
+    assert await _count(stack, "audit_links") == 0, "no orphan link"
+    assert AuditTrail.instance().pending_count() == 1, "event stays queued"
+
+    monkeypatch.undo()
+    assert await _flush(stack) == 1
+    _assert_linked_to(await _linked_rows(stack, "tool:finalize"), stack, action_id)
+    assert await _count(stack, "audit_events") == 1
+    assert await _count(stack, "audit_links") == 1

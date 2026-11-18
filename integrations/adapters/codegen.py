@@ -36,6 +36,22 @@ _LLM_TIMEOUT_SECONDS = 120.0  # cold-start model load can exceed 30s on CPU
 _LLM_CONNECT_TIMEOUT = 5
 
 
+def _linkage_kwargs(ctx: AdapterContext) -> dict[str, Any]:
+    """Audit provenance from the trusted context (None when absent).
+
+    Same contract as `integrations.adapters.builtin._linkage_kwargs`:
+    linkage is evidence only, never an input to any decision, and a missing
+    field is passed as None rather than invented.
+    """
+    return {
+        "user_id": getattr(ctx, "user_id", "") or None,
+        "task_id": getattr(ctx, "task_id", "") or None,
+        "run_id": getattr(ctx, "execution_run_id", "") or None,
+        "step_node_id": getattr(ctx, "step_id", "") or None,
+        "action_id": getattr(ctx, "action_id", "") or None,
+    }
+
+
 def _task_scope(workspace: str, ctx: object) -> str:
     """Directory a request is clamped into for THIS task.
 
@@ -562,6 +578,7 @@ class CodegenAdapter(ToolAdapter):
             AuditTrail.instance().log(
                 actor_id=ctx.actor_id, action="tool:codegen", resource=path,
                 allowed=False, details={"reason": "path outside workspace"},
+                **_linkage_kwargs(ctx),
             )
             return _done(False, error=f"Access denied: '{path}' is outside the workspace")
         write_result = await self._writer.execute({

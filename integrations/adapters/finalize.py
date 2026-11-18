@@ -29,6 +29,22 @@ from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
 
 
+def _linkage_kwargs(ctx: AdapterContext) -> dict[str, Any]:
+    """Audit provenance from the trusted context (None when absent).
+
+    Same contract as `integrations.adapters.builtin._linkage_kwargs`:
+    linkage is evidence only, never an input to any decision, and a missing
+    field is passed as None rather than invented.
+    """
+    return {
+        "user_id": getattr(ctx, "user_id", "") or None,
+        "task_id": getattr(ctx, "task_id", "") or None,
+        "run_id": getattr(ctx, "execution_run_id", "") or None,
+        "step_node_id": getattr(ctx, "step_id", "") or None,
+        "action_id": getattr(ctx, "action_id", "") or None,
+    }
+
+
 class FinalizeAdapter(ToolAdapter):
     """Write the task deliverable to a real file in the workspace.
 
@@ -101,6 +117,7 @@ class FinalizeAdapter(ToolAdapter):
             AuditTrail.instance().log(
                 actor_id=ctx.actor_id, action="tool:finalize", resource=path,
                 allowed=False, details={"reason": "path outside workspace"},
+                **_linkage_kwargs(ctx),
             )
             return AdapterResult(
                 success=False,
@@ -122,6 +139,7 @@ class FinalizeAdapter(ToolAdapter):
                 actor_id=ctx.actor_id, action="tool:finalize", resource=path,
                 allowed=False,
                 details={"reason": "workspace quota", **exc.status()},
+                **_linkage_kwargs(ctx),
             )
             return AdapterResult(
                 success=False, tool_id=self.id,

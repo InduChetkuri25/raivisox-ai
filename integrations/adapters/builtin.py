@@ -449,6 +449,7 @@ class ShellExecAdapter(ToolAdapter):
             AuditTrail.instance().log(
                 actor_id=ctx.actor_id, action="tool:shell_exec", resource=command,
                 allowed=False, details={"reason": reason},
+                **_linkage_kwargs(ctx),
             )
         entry = await self._sandbox.execute(command, timeout=params.get("timeout", self._timeout))
         blocked_by_tool = not allowed
