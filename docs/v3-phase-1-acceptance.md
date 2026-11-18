@@ -835,7 +835,7 @@ the non-live half), `Frontend (typecheck + build)`.
   `03bc703` (`test(v3): assert the DoD recovery guarantee, not the pass
   composition`) and `1a12bad` (`test(v3): assert the DoD regeneration
   guarantee, not the call total`) after the release.
-- `v1.0.0` untouched (`0fe1eca`); no release tag created, and Phase 2 not
+- `v1.0.0` untouched (`74e2c1d`); no release tag created, and Phase 2 not
   started.
 - Working tree clean after the documentation commit that records this report.
 
