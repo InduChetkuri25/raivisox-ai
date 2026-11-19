@@ -13,6 +13,9 @@
 #   RAIVISOX_LLM_BASE_URL OpenAI-compatible endpoint, e.g.
 #                         http://ollama:11434/v1 (enable the ollama profile)
 #                         or https://api.openai.com/v1 with RAIVISOX_LLM_API_KEY
+#   SANDBOX_BACKEND       explicit sandbox choice — 'container' (isolated) or
+#                         'process' + SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1
+#                         (documented NON-isolated posture). See docs/deployment.md §10.
 #
 # Optional profiles:  --profile ollama   (bundled local provider)
 
@@ -53,6 +56,17 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      # SECURITY (H1): task-generated code is never run unconfined by
+      # default in production. Choose the backend explicitly:
+      #   SANDBOX_BACKEND=container  → one isolated container per execution
+      #                                (this service must be able to reach a
+      #                                container runtime; see docs/deployment.md §10)
+      #   SANDBOX_BACKEND=process + SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1
+      #                              → the documented NON-isolated posture
+      # Do NOT mount /var/run/docker.sock (or any runtime socket) into this
+      # service: that grants host-wide control to the API process.
+      - SANDBOX_BACKEND=${SANDBOX_BACKEND:?SANDBOX_BACKEND is required in production — 'container' (isolated) or 'process' with SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1 (documented non-isolated posture); see docs/deployment.md §10}
+      - SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=${SANDBOX_ALLOW_PROCESS_IN_PRODUCTION:-}
       # Artifact storage limits (bytes / counts) — see docs/deployment.md
       - MAX_ARTIFACT_SIZE_BYTES=${MAX_ARTIFACT_SIZE_BYTES:-52428800}
       - MAX_ARTIFACTS_PER_TASK=${MAX_ARTIFACTS_PER_TASK:-1000}

@@ -552,3 +552,12 @@ workspace mount) and the final verdict — lives in
   an **invalid** `SANDBOX_BACKEND` value raises loudly at construction; a
   **valid but unavailable** backend fails each execution honestly (§5 row
   1) with no process-backend substitution.
+  The *production default* is answered separately (V3 audit finding H1) by
+  `services/execution/sandbox_policy.py`: `ENVIRONMENT=production` must
+  declare `SANDBOX_BACKEND` explicitly, and the unconfined `process` backend
+  is refused unless the operator sets
+  `SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1` (the documented **fail documented**
+  posture, logged as an explicit UNCONFINED warning). Development/test keep
+  the `process` default. This is a selection policy only — it does not add
+  isolation, and the deployment decision (dedicated sandbox executor vs. a
+  remote rootless runtime) is recorded in `docs/deployment.md` §10.

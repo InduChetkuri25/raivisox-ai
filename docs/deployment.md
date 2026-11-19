@@ -37,6 +37,7 @@ without them (fail-fast by design):
 | `NEXT_PUBLIC_API_URL` | `https://api.example.com` | API base URL **baked into the frontend bundle at build time**. |
 | `RAIVISOX_LLM_BASE_URL` | `http://ollama:11434/v1` or `https://api.openai.com/v1` | OpenAI-compatible provider endpoint. |
 | `DATABASE_URL` | set automatically inside compose | Explicit in non-compose deployments. Must be `postgresql+asyncpg://…` in production. |
+| `SANDBOX_BACKEND` | `container`, or `process` + `SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1` | Backend for task-generated code. Production refuses to start without an explicit choice and refuses the unconfined process backend without an acknowledgement — see §10. |
 
 Optional:
 
@@ -184,7 +185,8 @@ admin endpoint — see `docs/backups-recovery.md` §7.
 
 - Startup **refuses** to run on a missing/default `SECRET_KEY`,
   missing `DATABASE_URL`, empty `CORS_ORIGINS`, empty `ALLOWED_HOSTS`,
-  `DEBUG=true`, no LLM provider, or non-positive artifact limits —
+  `DEBUG=true`, no LLM provider, non-positive artifact limits, or an
+  undeclared / unconfined `SANDBOX_BACKEND` in production (§10) —
   naming variables only, never values.
 - Graceful shutdown cancels and awaits in-flight background pipelines
   and the artifact cleanup worker; any execution_run left open is closed
@@ -195,3 +197,111 @@ admin endpoint — see `docs/backups-recovery.md` §7.
 Terminate TLS at your proxy and forward to `api:8000` (uvicorn runs with
 `--proxy-headers`) and `web:3000`. Set `CORS_ORIGINS` to the exact
 browser-facing origins and `ALLOWED_HOSTS` to the public API hostname.
+
+## 10. Sandbox isolation for task-generated code (audit finding H1)
+
+### 10.1 What actually runs
+
+Every untrusted execution — `python_exec`, `shell_exec`, the codegen
+smoke-run and the DoD checks — goes through `build_default_sandbox()`
+(`services/execution/sandbox.py`), the single doorway. Which backend it
+returns is decided by `SANDBOX_BACKEND` through
+`services/execution/sandbox_policy.py`.
+
+`ProcessSandbox` (the development/test backend) enforces exactly this —
+`capabilities()` and `SandboxResult.enforced` are the per-run witness:
+
+| Guarantee | Process backend |
+|---|---|
+| argv execution (never a shell string) | yes |
+| minimal explicit child environment | yes |
+| working directory = the task workspace | yes |
+| bounded output, wall-clock timeout + tree kill | yes |
+| CPU / address-space / file-size rlimits | POSIX hosts only |
+| network deny | **no** (`network_deny: False`) |
+| filesystem confinement beyond cwd semantics | **no** (`fs_confinement: False`) |
+| process-count cap | **no** (`pids_limit: False`) |
+
+A working directory is not a boundary: the child keeps the API process's
+uid, so absolute paths (`/app/...`) stay reachable, and nothing blocks
+outbound sockets.
+
+### 10.2 Why that is not a production posture (H1)
+
+The production compose file previously declared no `SANDBOX_BACKEND`, so the
+factory defaulted to `ProcessSandbox` inside the API container. That means:
+
+- **Cross-tenant artifact access.** `/app/workspaces` is one tree for every
+  user; a child running as the API user can read and rewrite other tasks' and
+  users' files. App-layer path clamps do not apply to raw process execution.
+- **Application tampering.** `/app` is owned by `appuser` — the same uid the
+  child runs as — so task code can modify the running application.
+- **Unrestricted egress.** No network namespace is created: task code reaches
+  the internet and the compose network (PostgreSQL, the web tier, the model
+  server), enabling exfiltration and internal probing.
+- **Container-wide denial of service.** No PID or cumulative memory ceiling.
+- **Possible secret disclosure** where the host allows same-user
+  `/proc/<pid>/environ` reads (`ptrace_scope=0`). Not assumed, not excluded.
+
+Rlimits and timeouts bound a run; they do not confine it.
+
+### 10.3 What is enforced now (configuration, fail closed)
+
+| Environment | `SANDBOX_BACKEND` | Result |
+|---|---|---|
+| development / test | absent | `process` (unchanged) |
+| development / test | `process` / `container` | that backend |
+| **production** | **absent** | **startup refusal** — the API does not boot |
+| **production** | `process` | **refused** unless `SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1` |
+| **production** | `process` + acknowledgement | allowed; logs an explicit UNCONFINED warning |
+| production | `container` | allowed; each run fails honestly when no runtime is reachable |
+| any | unknown or explicitly empty | configuration error — never a substitute backend |
+
+These are deterministic configuration checks (no runtime required): they
+prove the selection, **not** isolation. `docker-compose.prod.yml` uses
+`${SANDBOX_BACKEND:?…}`, so compose fails fast on the same decision.
+
+### 10.4 Options considered
+
+| Option | Isolation | Ops complexity | Portability | Failure behavior | Verdict |
+|---|---|---|---|---|---|
+| A. Process backend in the API container | none (§10.1) | lowest | any | falls open to shared uid/net | rejected as default; acknowledged posture only |
+| B. Container backend with the runtime socket mounted into the API | per-container flags, plus a root-equivalent socket in the API | medium | Docker/Podman hosts | runtime outage stops executions (honest) | **rejected** — one API compromise would mean host-wide control |
+| B′. Container backend via a remote/rootless runtime (podman-remote over SSH, or a runtime-only sidecar with a narrow API) | same as B without a local socket | medium-high | Linux | honest fail-closed | acceptable interim on one host |
+| C. Dedicated sandbox execution service (API enqueues → isolated worker runs one throwaway container per run) | strongest: the API never touches a runtime | high (queue, worker identity, storage handoff, image supply chain) | any | queue/worker outage fails closed, retryable | **recommended target** |
+
+Mounting `/var/run/docker.sock` lets the containerised API start any
+container, mount the host filesystem and reach other containers — effective
+root on the host. Since task code runs in that same container, "compromise
+the API" and "control the host" would become one event. The shipped compose
+file mounts no runtime socket.
+
+### 10.5 Recommendation and status
+
+- **Done here:** the fail-closed configuration above, the compose requirement,
+  and this documentation of the real guarantees.
+- **Needs owner approval:** option C (or B′ as an interim on a single Linux
+  host). It requires infrastructure decisions — where the executor runs, how
+  it authenticates, which digest-pinned image it uses and who refreshes it,
+  and how artifacts/results are handed back.
+- **Until then:** production runs either with `SANDBOX_BACKEND=container` and
+  honest per-run failures (no execution without a reachable runtime), or with
+  the acknowledged `process` posture whose limits are listed above.
+
+H1 is **partially mitigated**: the silent insecure default is gone and cannot
+return without a deliberate, logged acknowledgement, but no isolation
+architecture is deployed and none is claimed.
+
+### 10.6 Remaining limitations
+
+- This change enforces a policy decision; it does not itself isolate anything.
+- Container-backend guarantees are verified only where a runtime exists (the
+  Linux `container-gate` CI job). No isolation is claimed for a runtime-less
+  or Windows host.
+- **Open packaging blocker (not fixed here):** the API image builds from
+  `./apps/api`, while `app.main` imports the repository-level `services.*` and
+  `integrations.*` packages, which that build context does not contain. The
+  documented compose image therefore cannot boot as written; fixing the build
+  context belongs to the owner-approved deployment work in §10.5.
+- No production container stack has been started and verified here; see the
+  verification note at the top of this document.

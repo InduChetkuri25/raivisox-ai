@@ -80,6 +80,11 @@ def make_env():
     env.update(
         {
             "ENVIRONMENT": "production",
+            # Local harness on a host with no container runtime: the
+            # documented NON-isolated posture is acknowledged explicitly
+            # (docs/deployment.md §10).
+            "SANDBOX_BACKEND": "process",
+            "SANDBOX_ALLOW_PROCESS_IN_PRODUCTION": "1",
             "SECRET_KEY": SECRET,
             "DATABASE_URL": "sqlite+aiosqlite:///" + DB.replace("\\", "/"),
             "CORS_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",

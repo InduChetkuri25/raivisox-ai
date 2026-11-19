@@ -6,8 +6,10 @@ platform-aware process backend. This module and its Phase 4 sibling
 codebase allowed to spawn an untrusted child process; every caller must go
 through ``ExecutionSandbox.run`` with an explicit, argv-only ``SandboxSpec``.
 ``build_default_sandbox`` selects the backend via ``SANDBOX_BACKEND``
-(process default; container opt-in; invalid values raise — never a silent
-fallback to another backend).
+(development/test default: process; production requires an explicit
+selection and refuses the unconfined process backend unless the operator
+acknowledges it; invalid values raise — never a silent fallback to another
+backend). The policy itself lives in ``services.execution.sandbox_policy``.
 
 Phase 1 scope (intentionally small):
 - argv execution only — never a shell string
@@ -30,6 +32,7 @@ Honesty rules (non-negotiable):
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -38,6 +41,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from services.execution.quotas import ExecutionBudget, SandboxQuota
+from services.execution.sandbox_policy import (
+    SandboxConfigError,
+    process_posture_notice,
+    resolve_backend_name,
+)
 from services.execution.workspace_quota import (
     WorkspaceEnforcer,
     WorkspaceQuota,
@@ -55,8 +63,11 @@ __all__ = [
     "ExecutionBudget",
     "WorkspaceQuota",
     "process_quota_reason",
+    "SandboxConfigError",
     "build_default_sandbox",
 ]
+
+_log = logging.getLogger(__name__)
 
 # POSIX-only signal numbers. They are absent on Windows, where subprocess
 # return codes are never negative — so the signal branch of the process
@@ -641,23 +652,27 @@ def process_quota_reason(returncode: int | None, enforced: list[str],
 def build_default_sandbox() -> ExecutionSandbox:
     """Factory used by adapters — backend selected by ``SANDBOX_BACKEND``.
 
-    - ``process`` (default): the Phase 1 :class:`ProcessSandbox`.
-    - ``container``: the Phase 4 ``ContainerSandbox`` (opt-in). It fails
-      honestly at ``run()`` when no container runtime is reachable — the
-      process backend is NEVER silently substituted.
-    - anything else: ``ValueError`` — an invalid backend is a configuration
-      error, not a license to pick another backend.
+    Selection is policy-checked (``services.execution.sandbox_policy``):
+
+    - ``process``: the Phase 1 :class:`ProcessSandbox` — the default in
+      development/test only. In production it is refused unless the operator
+      explicitly acknowledged the documented non-isolated posture.
+    - ``container``: the Phase 4 ``ContainerSandbox``. It fails honestly at
+      ``run()`` when no container runtime is reachable — the process backend
+      is NEVER silently substituted.
+    - unset in production, or anything else: ``SandboxConfigError`` (a
+      ``ValueError``) — a configuration error, not a license to pick another
+      backend.
     """
-    backend = os.environ.get("SANDBOX_BACKEND", "process").strip().lower()
+    backend = resolve_backend_name()
     # V2 closeout: workspace write quotas are on by default (generous
     # defaults; SANDBOX_WORKSPACE_* tunes them, 0/off disables explicitly).
     workspace_quota = WorkspaceQuota.from_env()
     if backend == "process":
+        notice = process_posture_notice()
+        if notice:
+            _log.warning(notice)
         return ProcessSandbox(workspace_quota=workspace_quota)
-    if backend == "container":
-        from services.execution.container_sandbox import ContainerSandbox
+    from services.execution.container_sandbox import ContainerSandbox
 
-        return ContainerSandbox(workspace_quota=workspace_quota)
-    raise ValueError(
-        f"invalid SANDBOX_BACKEND {backend!r}: expected 'process' or 'container'"
-    )
+    return ContainerSandbox(workspace_quota=workspace_quota)

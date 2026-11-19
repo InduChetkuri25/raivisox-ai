@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     anthropic_api_key: Optional[str] = None
     google_api_key: Optional[str] = None
 
+    # Sandbox backend selection for task-generated code. Empty = not
+    # configured; production requires it explicitly (see
+    # services/execution/sandbox_policy.py and docs/deployment.md §10).
+    sandbox_backend: str = ""
+    # Explicit acknowledgement of the documented NON-isolated production
+    # posture. String (not bool) so an empty value is simply "not given"
+    # rather than a parsing error; meaning is decided by the policy module.
+    sandbox_allow_process_in_production: str = ""
+
     # Execution
     default_execution_mode: str = "BALANCED"
     max_execution_budget: Optional[float] = None
@@ -213,6 +222,26 @@ def validate_settings(s: "Settings") -> None:
             "DEBUG must be false in production (debug mode returns internal "
             "error details to clients)"
         )
+
+    # Task-generated code: production never falls through to an unconfined
+    # backend by default. One source of truth — the same policy the runtime
+    # factory applies (services/execution/sandbox_policy.py), so startup and
+    # execution can never disagree about which backends are permitted.
+    from services.execution.sandbox_policy import (
+        PROCESS_ACK_ENV,
+        SandboxConfigError,
+        resolve_backend_name,
+    )
+
+    sandbox_env = {"ENVIRONMENT": env}
+    if s.sandbox_backend.strip():
+        sandbox_env["SANDBOX_BACKEND"] = s.sandbox_backend
+    if s.sandbox_allow_process_in_production.strip():
+        sandbox_env[PROCESS_ACK_ENV] = s.sandbox_allow_process_in_production
+    try:
+        resolve_backend_name(sandbox_env)
+    except SandboxConfigError as exc:
+        problems.append(f"sandbox isolation: {exc}")
 
     if not provider_configured(s):
         problems.append(

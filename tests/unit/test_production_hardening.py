@@ -83,6 +83,9 @@ def _production_settings(**overrides) -> Settings:
         cors_origins="https://app.example.test",
         allowed_hosts="api.example.test",
         debug=False,
+        # A valid production config declares its sandbox backend explicitly
+        # (production refuses the unconfined process default — H1).
+        sandbox_backend="container",
     )
     base.update(overrides)
     return Settings(**base)
@@ -449,6 +452,8 @@ def test_production_import_fails_fast_without_config():
     assert "SECRET_KEY" in out
     assert "CORS_ORIGINS" in out
     assert "ALLOWED_HOSTS" in out
+    # Task-generated code is never run unconfined by default either.
+    assert "SANDBOX_BACKEND" in out
     assert DEV_SECRET_KEY not in out
     assert "postgres:postgres" not in out
 
@@ -462,6 +467,7 @@ def test_production_import_succeeds_with_valid_config(tmp_path):
         CORS_ORIGINS="https://app.example.test",
         ALLOWED_HOSTS="api.example.test",
         RAIVISOX_LLM_BASE_URL="http://127.0.0.1:11434/v1",
+        SANDBOX_BACKEND="container",
         DEBUG=None,
     )
     proc = subprocess.run(
