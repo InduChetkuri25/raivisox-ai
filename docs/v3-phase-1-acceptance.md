@@ -31,7 +31,10 @@ New:
 - `services/graph/schema.py` — closed event/outcome/evidence sets, per-type
   payload allowlists, normalizers, redaction, deterministic idempotency keys.
 - `services/graph/actions.py` — bounded per-process registry of live
-  `action_id`s (TTL 300 s, pruned on every touch).
+  `action_id`s: issued with the invocation's trusted binding (actor/user/task/
+  run/step/tool), refreshed by every accepted event, retired in the registry's
+  `finally`; `IDLE_TTL_SECONDS` (1800 s, measured from last accepted activity)
+  is a leak backstop only, not an execution deadline.
 - `services/graph/provenance.py` — `verify_subject` / `resolve_run_provenance`
   against `tasks` and `execution_runs`; `ProvenanceError` on mismatch.
 - `services/graph/events.py` — `emit()` (append-only writer), `read_events()`
@@ -100,9 +103,13 @@ target normalization → idempotency key → **one** ownership query → insert.
 - **Missing identity** (`user_id`/`task_id` empty) ⇒ no row,
   `skipped_no_provenance` counter. Nothing is attributed to "someone".
 - **Mismatched/forged identity** (`user_id` not `tasks.user_id`, `run_id` not
-  an `execution_runs` row of that task, unknown `action_id`) ⇒
-  `ProvenanceError`, no row. This is the only exception `emit()` raises into a
-  pipeline, and it is an integrity fault, not a runtime condition.
+  an `execution_runs` row of that task) ⇒ `ProvenanceError`, no row. This is
+  the only exception `emit()` raises into a pipeline, and it is an integrity
+  fault, not a runtime condition.
+- **Unknown, expired or borrowed `action_id`** ⇒ no row, `invalid` counter,
+  never an exception: an id the registry did not issue, one already retired or
+  reaped, or one whose bound actor/user/task/run/step/tool contradicts the
+  event is not accepted.
 - **Duplicate delivery** ⇒ deterministic key `"{event_type}:{action_id}"`
   (artifacts: `"artifact.registered:{artifact_id}"`); the unique constraint
   makes a retry a no-op (`duplicates` counter), while a second execution has a
@@ -185,6 +192,14 @@ per-file evidence in §6.
 | T15 | `test_provenance.py::test_adapter_without_provenance_writes_no_events` | PASS |
 | T15b | `test_graph_events.py::test_writer_only_inserts` | PASS |
 | T16 | `test_provenance.py::test_unknown_action_id_is_rejected` | PASS |
+| T16b | `test_action_lifecycle.py::test_action_stays_live_past_old_deadline_and_terminal_is_accepted` | PASS |
+| T16c | `test_action_lifecycle.py::test_registry_invocation_longer_than_old_ttl_keeps_its_terminal_event` | PASS |
+| T16d | `test_action_lifecycle.py::test_cleanup_removes_the_action_on_success` / `…_on_kernel_denial` / `…_when_the_adapter_raises` / `…_on_cancellation` | PASS |
+| T16e | `test_action_lifecycle.py::test_abandoned_action_is_reaped_after_the_idle_window` | PASS |
+| T16f | `test_action_lifecycle.py::test_borrowed_action_id_with_foreign_identity_is_rejected` | PASS |
+| T16g | `test_action_lifecycle.py::test_two_invocations_same_tool_cannot_share_an_id` / `::test_concurrent_invocations_do_not_interfere` / `::test_registry_is_thread_safe_under_concurrent_use` | PASS |
+| T16h | `test_action_lifecycle.py::test_accepted_use_refreshes_the_backstop` | PASS |
+| T16i | `test_action_lifecycle.py::test_unknown_action_id_is_still_rejected` | PASS |
 | T17 | `test_provenance.py::test_identity_fields_are_not_read_from_params` | PASS |
 | T18 | `test_audit_linkage.py::test_audit_row_carries_user_task_run_action` | PASS |
 | T18b | `test_audit_linkage.py::test_link_and_audit_row_are_atomic` | PASS |
@@ -496,6 +511,16 @@ Nothing here is a human approval of those gates.
   plain unbounded wait would hang rather than error, which is why the tests set
   the timeout the way a deployment would. SQLite remains the dialect every
   other test uses.
+- Action liveness is lifecycle-based, not deadline-based: an id is retired in
+  the invocation's `finally`, and the 1800 s `IDLE_TTL_SECONDS` backstop is
+  measured from the last accepted event. Consequence, stated plainly: an
+  invocation that stays silent for longer than that window (no event at all)
+  would lose its later events as `invalid`. The bound is far above the longest
+  bounded silence in Phase 1 (codegen ≈ 1080 s) and is a leak guard, not a
+  timeout an invocation is expected to race. A compromised in-process adapter
+  can still emit with *its own* invocation's id — that is inherent to running
+  inside the process and remains the documented A2 residual risk; it can no
+  longer speak as another invocation's tool/step/run.
 - Child-process I/O, header/body contents, resolved IPs, clock skew: out of
   scope by design and not claimed.
 - Rollback is `alembic downgrade 002`, which drops the two new tables and

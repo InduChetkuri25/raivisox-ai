@@ -131,7 +131,18 @@ class AdapterRegistry:
         """
         adapter = self.get(adapter_id)
         action_id = str(uuid.uuid4())
-        graph_actions.register(action_id)
+        # The binding is the trusted context at issue time. The writer refuses
+        # any event that contradicts it, so a different tool/step/run cannot
+        # borrow this invocation's id (and the id is retired in `finally`).
+        graph_actions.register(
+            action_id,
+            actor_id=ctx.actor_id,
+            user_id=getattr(ctx, "user_id", "") or "",
+            task_id=getattr(ctx, "task_id", "") or "",
+            run_id=getattr(ctx, "execution_run_id", "") or "",
+            step_node_id=getattr(ctx, "step_id", "") or "",
+            tool_id=adapter.id,
+        )
 
         await _guard(
             _emit(

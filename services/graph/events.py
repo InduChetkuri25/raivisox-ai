@@ -185,8 +185,18 @@ async def emit(
         if not action_id or not schema.is_uuid(action_id):
             _inc("invalid")
             return False
-        # An adapter may only speak about an invocation the registry issued.
-        if not actions.is_live(action_id):
+        # An adapter may only speak about an invocation the registry issued,
+        # and only as that invocation: the trusted binding captured at
+        # registration must agree with the identity this event carries.
+        if not actions.validate(
+            action_id,
+            actor_id=actor_id,
+            user_id=user_id,
+            task_id=task_id,
+            run_id=run_id,
+            step_node_id=step_node_id,
+            tool_id=tool_id,
+        ):
             _inc("invalid")
             return False
 

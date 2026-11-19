@@ -691,11 +691,35 @@ path.
    registry supplies `action_id`; the handle supplies identity.
 3. `ctx.action_id` is written by the registry *after* it generates the id, and adapters
    treat it as untrusted input: the writer validates that the `action_id` it receives
-   **matches the action_id the registry registered for this invocation** (a per-process set
-   of live action ids) before accepting an adapter-level event. An adapter that overwrites
-   the field with an id the registry never issued is refused (T16).
+   **matches the live registration for this invocation** before accepting an adapter-level
+   event. A registration carries a trusted binding — actor, user, task, run, step, tool —
+   captured from the context at issue time, and an event that contradicts any bound field
+   is refused, so one invocation cannot borrow another's id (T16, T16f–T16g). An adapter
+   that overwrites the field with an id the registry never issued is refused (T16).
+   Liveness follows the invocation rather than a fixed deadline (§6.4.1).
 4. Nothing in the graph writer reads `params`, `request.body`, or environment variables.
 5. `user_id` is never accepted from a request path: no Phase 1 API exists.
+
+### 6.4.1 Action liveness (lifecycle, not a deadline)
+
+An `action_id` lives exactly as long as its invocation:
+
+- **Issue.** The registry registers the id with the trusted binding (actor, user, task,
+  run, step, tool) before the first lifecycle event. A bound field is immutable.
+- **Use.** Every accepted event validates against that binding and refreshes the entry, so
+  an invocation that keeps producing evidence stays live however long it runs. Codegen's
+  worst case (120 s per LLM call × 3 attempts × 3 repair rounds ≈ 1080 s of silence between
+  its first and last event) is therefore recorded in full (T16b–T16c).
+- **Completion.** The registry retires the id in its `finally`, covering success, kernel
+  denial, adapter exception and task cancellation (T16d).
+- **Backstop.** `IDLE_TTL_SECONDS` (1800 s, measured from the last accepted activity, not
+  from issue) reaps an entry whose owner never reached cleanup. It is a leak-prevention
+  backstop, never an execution deadline: it cannot expire an active invocation, and it is
+  well above the longest bounded silence above (T16h–T16i).
+
+Memory stays bounded — entries exist only for active invocations plus abandoned ones for at
+most one idle window — and the registry is guarded by a lock, so concurrent invocations
+(threads or tasks) cannot interfere (T16g).
 
 ### 6.5 Cross-user invariants
 
@@ -948,6 +972,14 @@ marked *existing*).
 | T15 | `test_provenance.py::test_adapter_without_provenance_writes_no_events` | `AdapterContext` with empty `user_id`/`execution_run_id` | `registry.run` on `fs_read` | zero rows; `skipped_no_provenance` incremented; adapter result unchanged | unattributable actions are not recorded as belonging to someone |
 | T15b | `test_graph_events.py::test_writer_only_inserts` | model introspection + one emit | inspect `GraphEvent` | no `updated_at` column; the writer module exposes no update/delete helper; the row is unchanged after a re-emit | evidence is append-only by construction |
 | T16 | `test_provenance.py::test_unknown_action_id_is_rejected` | adapter emits with an `action_id` the registry never issued | emit | no row; counter incremented | a compromised adapter cannot invent an invocation |
+| T16b | `test_action_lifecycle.py::test_action_stays_live_past_old_deadline_and_terminal_is_accepted` | registration, then 421 s of controlled clock | emit terminal | row written | liveness follows the invocation, not a 300 s deadline |
+| T16c | `test_action_lifecycle.py::test_registry_invocation_longer_than_old_ttl_keeps_its_terminal_event` | full registry run whose adapter advances the clock 600 s | registry | `tool.attempted` + `tool.executed`, same provenance | long-running tools keep their terminal event |
+| T16d | `test_action_lifecycle.py::test_cleanup_removes_the_action_on_success`, `::test_cleanup_removes_the_action_on_kernel_denial`, `::test_cleanup_removes_the_action_when_the_adapter_raises`, `::test_cleanup_removes_the_action_on_cancellation` | every exit path | registry `finally` | `live_count() == 0` each time | deterministic cleanup, including exceptions and cancellation |
+| T16e | `test_action_lifecycle.py::test_abandoned_action_is_reaped_after_the_idle_window` | registration never completed, clock advanced past the idle window | registry lookup | entry gone; `live_count() == 0` | abandoned entries cannot accumulate |
+| T16f | `test_action_lifecycle.py::test_borrowed_action_id_with_foreign_identity_is_rejected` | live id used with a foreign tool, step or run | emit | no row | ids are not transferable between invocations |
+| T16g | `test_action_lifecycle.py::test_two_invocations_same_tool_cannot_share_an_id`, `::test_concurrent_invocations_do_not_interfere`, `::test_registry_is_thread_safe_under_concurrent_use` | same tool, two steps, interleaved and threaded | registry/emit | each event keeps its own step and tool; no cross-talk | concurrent invocations are independent and the registry is lock-safe |
+| T16h | `test_action_lifecycle.py::test_accepted_use_refreshes_the_backstop` | two idle windows of activity | validate | still live | use, not age, drives the backstop |
+| T16i | `test_action_lifecycle.py::test_unknown_action_id_is_still_rejected` | random id after the lifecycle change | emit | no row | the unknown-id guarantee is unchanged |
 | T17 | `test_provenance.py::test_identity_fields_are_not_read_from_params` | `params={"user_id": victim, "task_id": victim_task}` with a real ctx | full run | event `user_id`/`task_id` equal the **ctx/task** values, not the params | client-controlled params can never set identity |
 | T18 | `test_audit_linkage.py::test_audit_row_carries_user_task_run_action` | pipeline run with `fs_write` (denial and success) | flush, read `audit_events` + `audit_links` | one link row per new audit row; `user_id/task_id/run_id/action_id` populated; `actor_id=pipeline-service` | closes audit gap 1 without touching the audit table |
 | T18b | `test_audit_linkage.py::test_link_and_audit_row_are_atomic` | flush patched so the `audit_links` insert raises | `flush_pending` | nothing persisted (no orphan audit row, no orphan link); events remain pending; a later flush persists both | linkage can never be silently dropped |
