@@ -137,7 +137,8 @@ class TerminalSandbox:
             return False, f"Command not in allow list. Allowed patterns: {self._allow_list}"
         return True, "Allowed (no restrictions)"
 
-    async def execute(self, command: str, timeout: int = 30) -> dict:
+    async def execute(self, command: str, timeout: int = 30,
+                      provenance: dict[str, str] | None = None) -> dict:
         """Execute a command with policy, containment, timeout, and history."""
         allowed, reason = self.is_allowed(command)
         entry = {
@@ -184,6 +185,9 @@ class TerminalSandbox:
             argv=argv,
             cwd=cwd,
             env={},  # sandbox builds the minimal allowlisted env
+            # Trusted identity from the caller's AdapterContext (the worker
+            # backend refuses an unattributed remote execution).
+            provenance=provenance or {},
             timeout_s=float(timeout),
             workspace_writable=cwd,
         )

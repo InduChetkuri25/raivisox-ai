@@ -2892,6 +2892,9 @@ async def run_task_pipeline(
                 # Phase 0 containment: reject module dirs that resolve
                 # outside the task workspace before spawning anything.
                 workspace_root=TASK_WORKSPACE,
+                # Attribution for the execution boundary (worker backend).
+                provenance={"task_id": task_id, "run_id": run_id,
+                            "step_id": "dod"},
             )
             for artifact in artifacts
         ]

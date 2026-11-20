@@ -51,6 +51,30 @@ class AdapterResult:
         }
 
 
+def sandbox_provenance(ctx: "AdapterContext | None") -> dict[str, str]:
+    """Trusted identity for a sandboxed run, from the kernel AdapterContext.
+
+    The worker backend needs to attribute a remote execution to a task, run and
+    step. Those values are server-derived (the pipeline builds the context; a
+    tool parameter can never set them), so a request cannot forge them. Absent
+    values are omitted rather than invented: the worker refuses an anonymous
+    request instead of accepting a guessed owner.
+    """
+    if ctx is None:
+        return {}
+    out: dict[str, str] = {}
+    for key, value in (
+        ("task_id", getattr(ctx, "task_id", "")),
+        ("run_id", getattr(ctx, "execution_run_id", "")),
+        ("step_id", getattr(ctx, "step_id", "")),
+        ("user_id", getattr(ctx, "user_id", "")),
+    ):
+        text = str(value or "").strip()
+        if text:
+            out[key] = text
+    return out
+
+
 class ToolAdapter(ABC):
     """Base class for pipeline-executable tool adapters."""
 

@@ -16,7 +16,12 @@ import os
 import sys
 from typing import Any
 
-from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
+from integrations.adapters.base import (
+    AdapterContext,
+    AdapterResult,
+    ToolAdapter,
+    sandbox_provenance,
+)
 from integrations.tools.file_reader import FileReaderTool
 from integrations.tools.file_writer import FileWriterTool
 from services.execution.sandbox import ExecutionSandbox, SandboxSpec, build_default_sandbox
@@ -451,7 +456,11 @@ class ShellExecAdapter(ToolAdapter):
                 allowed=False, details={"reason": reason},
                 **_linkage_kwargs(ctx),
             )
-        entry = await self._sandbox.execute(command, timeout=params.get("timeout", self._timeout))
+        entry = await self._sandbox.execute(
+            command,
+            timeout=params.get("timeout", self._timeout),
+            provenance=sandbox_provenance(ctx),
+        )
         blocked_by_tool = not allowed
         return AdapterResult(
             success=(entry.get("exit_code") == 0) and not blocked_by_tool,
@@ -509,6 +518,8 @@ class PythonExecAdapter(ToolAdapter):
             argv=[sys.executable, "-c", code],
             cwd=scope,
             env={},  # sandbox builds the minimal allowlisted env — no inheritance
+            # Trusted identity of THIS invocation for the worker boundary.
+            provenance=sandbox_provenance(ctx),
             timeout_s=float(self._timeout),
             workspace_writable=scope,
         )

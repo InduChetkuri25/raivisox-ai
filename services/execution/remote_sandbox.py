@@ -157,20 +157,19 @@ class WorkerSandbox(ExecutionSandbox):
     def _build_request(self, spec: SandboxSpec, request_id: str) -> ExecutionRequest:
         """Translate the adapter's spec into the signed wire request.
 
-        Provenance is taken from the spec's *server-built* environment keys
-        (``RAIVISOX_TASK_ID`` / ``RAIVISOX_RUN_ID`` / ``RAIVISOX_STEP_ID``) —
-        the adapter derives those from the execution context, never from a
-        tool parameter. A caller that cannot supply them gets a refused run,
-        not an anonymous one.
+        Provenance comes from ``spec.provenance``, which adapters fill from the
+        kernel-issued ``AdapterContext`` (task / execution run / step / user) —
+        never from a tool parameter. A caller that cannot supply it gets a
+        refused run, not an anonymous one.
         """
-        task_id = spec.env.get("RAIVISOX_TASK_ID", "").strip()
-        run_id = spec.env.get("RAIVISOX_RUN_ID", "").strip()
-        step_id = spec.env.get("RAIVISOX_STEP_ID", "").strip()
+        task_id = (spec.provenance.get("task_id") or "").strip()
+        run_id = (spec.provenance.get("run_id") or "").strip()
+        step_id = (spec.provenance.get("step_id") or "").strip()
         if not task_id or not run_id:
             raise SandboxConfigError(
-                "worker backend requires RAIVISOX_TASK_ID and RAIVISOX_RUN_ID in "
-                "the sandbox spec environment (provenance must come from the "
-                "authenticated execution context, never from tool parameters)"
+                "worker backend requires task_id and run_id provenance on the "
+                "sandbox spec (derived from the execution context, never from "
+                "tool parameters)"
             )
         return ExecutionRequest(
             request_id=request_id,

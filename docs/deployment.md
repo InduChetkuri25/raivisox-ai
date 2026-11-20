@@ -445,3 +445,111 @@ the worker is unreachable.
   program.
 - **Verified on Linux only**, with a real Docker daemon; no isolation is
   claimed for a runtime-less or Windows host.
+
+## 11. The whole stack, end to end (acceptance gate)
+
+`tests/integration/production_stack_gate.py` boots the **shipped** production
+compose file and proves the system works as one stack — not as isolated
+images. It is the same script the `production-stack-gate` CI job runs:
+
+```bash
+# Linux host with Docker + Compose v2, from the repository root:
+pip install "httpx>=0.27.0"
+python tests/integration/production_stack_gate.py
+```
+
+The gate writes its own `.stack-gate.env` (gitignored, mode 600, test-only
+values), so it never touches your `.env`. Every check prints `PASS`/`FAIL` and
+any failure exits non-zero; nothing is skipped.
+
+### 11.1 What it does, in order
+
+1. `docker compose build` for the API, the worker and the web frontend from
+   this checkout.
+2. Start `postgres`, wait for **healthy**; start `sandbox-worker`, wait for
+   **healthy**; start `api` and `web`. The API must answer
+   `GET /health/ready` with `status: ready` under `ENVIRONMENT=production`
+   (`DEBUG=false`), and the frontend must answer on `:3000`.
+3. **Migrations** through the image's own entrypoint (`alembic upgrade head`
+   in `apps/api/Dockerfile`): `alembic current` must equal `alembic heads`,
+   the required tables must exist, and `select version()` must be PostgreSQL.
+4. **Stack shape**: the API container has no runtime socket, no docker CLI
+   and no `DOCKER_HOST`; the worker has the socket, the shared token and
+   nothing else (no `DATABASE_URL`, `SECRET_KEY` or provider key).
+5. **API surface**: readiness reports database + storage ok and the LLM as
+   not reachable (there is no model in CI — see §11.4); `/docs`, `/redoc` and
+   `/openapi.json` are 404; CORS echoes only the configured origin;
+   unauthenticated task listing is refused.
+6. **Real execution workflow** through the authenticated HTTP API:
+   - a full task reaches `completed` / `verified` with a satisfied
+     definition-of-done, one closed `execution_runs` row, registered
+     artifacts whose SHA-256 matches the downloaded bytes, and a flat,
+     traversal-safe ZIP bundle;
+   - `python_exec` and `shell_exec` run through the kernel-gated registry
+     inside throwaway containers (real, non-simulated steps);
+   - a step that exceeds its timeout fails the task honestly (no false
+     success) and leaves no run `running`.
+7. **Provenance and audit** in PostgreSQL: `audit_links` rows for the task and
+   the run carry an `action_id`; `tool:*` audit events are linked; with
+   `V3_EVENTS_ENABLED=1` the `graph_events` rows cover `tool.attempted` →
+   `tool.executed` for the run; the worker's log attributes the execution to
+   the real `task_id` and `run_id`.
+8. **Restarts**: worker restart (execution still works), API restart (state
+   survives, no run left `running`, no task stuck active), PostgreSQL restart
+   (data survives and readiness recovers).
+9. **Failures**: no worker → the task fails with an unreachable-worker error
+   and **no** process fallback; a wrong worker key is refused with 401; three
+   concurrent runs finish serialized 2-at-a-time (the concurrency ceiling
+   holds); no `raivisox-sbx-*` container survives.
+10. **Shared-workspace security**: per-run directories; a symlink pointing at
+    a sibling run is unreadable inside the sandbox; a write into a sibling run
+    is refused; no world-writable path exists under the workspace root; a
+    foreign user gets 404 for another user's artifacts.
+
+### 11.2 Workspace ownership (required)
+
+`RAIVISOX_WORKSPACE_DIR` must be an **absolute host directory owned by uid
+1000** (the API user and `SANDBOX_CONTAINER_USER`). A directory owned by any
+other uid is not writable by the API, and every run fails at its first file
+write. Provision it as root before the first start:
+
+```bash
+install -d -o 1000 -g 1000 -m 0755 /srv/raivisox/workspaces
+```
+
+The gate does the same chown and asserts it.
+
+### 11.3 Start, health, shutdown
+
+```bash
+cp .env.example .env      # fill every ${VAR:?}; see §2
+docker compose -f docker-compose.prod.yml up -d --build   # migrates, then serves
+docker compose -f docker-compose.prod.yml ps              # every service healthy
+curl -fsS http://127.0.0.1:8000/health/ready             # {"status":"ready",...}
+curl -fsS http://127.0.0.1:8000/health/live              # liveness only
+docker compose -f docker-compose.prod.yml logs -f api sandbox-worker
+docker compose -f docker-compose.prod.yml down            # graceful shutdown
+```
+
+`SIGTERM` drains the API: in-flight pipelines are cancelled and every open
+`execution_runs` row is closed, so a restart never leaves a task stuck active
+(the gate asserts this). Compose restarts services with `restart:
+unless-stopped`; there is no durable queue, so a task interrupted by a hard
+kill is marked `failed` with its interruption stage at next start rather than
+resumed.
+
+### 11.4 What the gate does **not** claim
+
+- **No LLM is exercised.** `RAIVISOX_LLM_BASE_URL` points at a closed port, so
+  the model-backed planning/generation path is not verified by CI; the
+  rule-based planner and the codegen adapter's deterministic engine run the
+  pipeline instead. Model quality and LLM-driven execution remain unverified
+  in CI and must be checked against a real endpoint.
+- **Event emission is on for the gate only.** `V3_EVENTS_ENABLED=1` is a CI
+  input, not the production default (the V3 Phase 1 decision keeps graph
+  events off outside dev/test/CI). Switching it on in production requires that
+  decision to be revisited.
+- **Idempotency is per-process memory.** A worker restart forgets completed
+  request ids, so a retry after a restart can execute again; the API only
+  retries on transport errors within one call. Exactly-once execution is not
+  claimed (§10.8).

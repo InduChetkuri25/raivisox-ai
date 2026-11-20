@@ -105,6 +105,11 @@ class SandboxSpec:
     argv: list[str]
     cwd: str                        # absolute; the task's workspace scope
     env: dict[str, str]             # explicit allowlist build — never os.environ
+    # Trusted identity of the invocation, taken from the server-side execution
+    # context (task/run/step), never from tool parameters. The worker backend
+    # refuses a spec without it, because a remote execution can only be
+    # attributed if the caller states who it is from trusted state.
+    provenance: dict[str, str] = field(default_factory=dict)
     timeout_s: float = 30.0
     cpu_seconds: int | None = None      # enforced on POSIX (rlimit) only
     memory_bytes: int | None = None     # enforced on POSIX (rlimit) only
@@ -124,6 +129,13 @@ class SandboxSpec:
             raise ValueError("SandboxSpec.env must be a dict")
         if self.timeout_s <= 0:
             raise ValueError("SandboxSpec.timeout_s must be positive")
+        if not isinstance(self.provenance, dict):
+            raise ValueError("SandboxSpec.provenance must be a dict")
+        for key, value in self.provenance.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("SandboxSpec.provenance must be str->str")
+            if "\x00" in value or len(value) > 256:
+                raise ValueError("SandboxSpec.provenance values must be short strings")
 
 
 @dataclass

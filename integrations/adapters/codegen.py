@@ -28,6 +28,7 @@ from typing import Any
 
 from integrations.adapters.base import AdapterContext, AdapterResult, ToolAdapter
 from integrations.tools.file_writer import FileWriterTool
+from integrations.adapters.base import sandbox_provenance
 from services.execution.sandbox import ExecutionSandbox, SandboxSpec, build_default_sandbox
 from services.security.audit_trail import AuditTrail
 from services.security.path_containment import contained_path
@@ -427,7 +428,8 @@ class CodegenAdapter(ToolAdapter):
         return violations
 
     async def _solve_probe(
-        self, module_stem: str, module_dir: str, timeout: int | None = None
+        self, module_stem: str, module_dir: str, timeout: int | None = None,
+        provenance: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Import the module AND execute solve() in a sandboxed subprocess.
 
@@ -457,6 +459,7 @@ class CodegenAdapter(ToolAdapter):
             argv=[sys.executable, "-c", probe_code],
             cwd=module_dir,
             env={},  # sandbox builds the minimal allowlisted env
+            provenance=provenance or {},
             timeout_s=float(effective_timeout),
             # Generous but bounded: stdout[:2000] is taken downstream, and
             # heavy stdout must not crowd out the probe's own result line
@@ -612,6 +615,7 @@ class CodegenAdapter(ToolAdapter):
             module_stem,
             os.path.dirname(os.path.abspath(written_to)),
             timeout=int(params["smoke_timeout"]) if params.get("smoke_timeout") else None,
+            provenance=sandbox_provenance(ctx),
         )
         smoke["module"] = module_stem
         output = {

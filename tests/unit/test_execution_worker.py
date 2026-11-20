@@ -186,8 +186,8 @@ def _spec(**kwargs) -> SandboxSpec:
     base = dict(
         argv=["python", "-c", "print('ok')"],
         cwd="/app/workspaces/tasks/task-1/run-1",
-        env={"RAIVISOX_TASK_ID": "task-1", "RAIVISOX_RUN_ID": "run-1",
-             "RAIVISOX_STEP_ID": "step-2"},
+        env={},
+        provenance={"task_id": "task-1", "run_id": "run-1", "step_id": "step-2"},
         timeout_s=5,
     )
     base.update(kwargs)
@@ -198,7 +198,7 @@ def _spec(**kwargs) -> SandboxSpec:
 async def test_worker_sandbox_requires_context_provenance():
     """A spec without server-built provenance is refused, never anonymised."""
     sb = WorkerSandbox(_URL, _TOKEN)
-    spec = _spec(env={})
+    spec = _spec(provenance={})
     result = await sb.run(spec)
     assert result.error is not None and "provenance" in result.error
     assert result.killed_reason == "supervisor"

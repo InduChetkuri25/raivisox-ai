@@ -138,9 +138,9 @@ async def _client_main() -> int:
         os.makedirs(scope, exist_ok=True)
         return SandboxSpec(
             argv=argv, cwd=scope,
-            env={"RAIVISOX_TASK_ID": task or task_id,
-                 "RAIVISOX_RUN_ID": run_id,
-                 "RAIVISOX_STEP_ID": f"step-{seq['n']}"},
+            env={},
+            provenance={"task_id": task or task_id, "run_id": run_id,
+                        "step_id": f"step-{seq['n']}"},
             timeout_s=timeout_s,
             output_limit_bytes=1_048_576,
         )

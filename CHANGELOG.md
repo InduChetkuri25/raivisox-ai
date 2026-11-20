@@ -61,6 +61,16 @@ release-blocker review: none found) and the PostgreSQL Live Gate passed
 
 ### Fixed
 
+- **Worker-backed sandbox execution always failed** — the execution
+  provenance (`task_id`/`run_id`/`step_id`) was passed through
+  `SandboxSpec.env`, which the adapters set to `{}` and the worker's
+  `_ALLOWED_ENV_KEYS` allow-list strips, so every `python_exec`,
+  `shell_exec`, codegen probe and DoD run under `SANDBOX_BACKEND=worker`
+  died with "worker backend requires ... provenance". Provenance is now a
+  first-class `SandboxSpec.provenance` field filled from the kernel-issued
+  `AdapterContext`, and the worker enforces it as before. Found and fixed
+  by the full-stack acceptance gate; the container/process backends and the
+  isolation gate are unaffected.
 - **PostgreSQL artifact registration** — the same-path supersession
   write-lock used the SQLite boolean literal `is_current = 1`, which
   PostgreSQL rejects (`operator does not exist: boolean = integer`);

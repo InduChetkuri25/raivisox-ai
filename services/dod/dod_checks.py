@@ -251,6 +251,7 @@ async def run_module_checks_async(
     override_return: Any = None,
     sandbox: ExecutionSandbox | None = None,
     workspace_root: str | None = None,
+    provenance: dict[str, str] | None = None,
 ) -> DoDCheckResult:
     """Derive checks from the goal and run them against the module's solve().
 
@@ -294,6 +295,9 @@ async def run_module_checks_async(
         argv=[sys.executable, "-c", probe],
         cwd=module_dir,
         env={},  # sandbox builds the minimal allowlisted env
+        # Attribution of this verification run, from the caller's execution
+        # context (the worker backend refuses an unattributed execution).
+        provenance=provenance or {},
         timeout_s=float(timeout),
         # Generous but bounded capture: the value line is the LAST line of
         # stdout, so it must survive even a noisy module (the pre-sandbox
