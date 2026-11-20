@@ -145,9 +145,10 @@ services:
       # The API and the worker must hold the SAME key; nothing else is shared.
       - SANDBOX_WORKER_TOKEN=${SANDBOX_WORKER_TOKEN:-}
       - SANDBOX_WORKER_WORKSPACE_ROOT=/app/workspaces/tasks
-      # Where that directory lives on the HOST (the runtime daemon resolves
-      # bind sources there). Without it the worker assumes identical paths.
-      - SANDBOX_HOST_WORKSPACE_ROOT=${RAIVISOX_WORKSPACE_DIR:?RAIVISOX_WORKSPACE_DIR is required}
+      # The HOST path of exactly what SANDBOX_WORKER_WORKSPACE_ROOT names —
+      # the runtime daemon resolves bind sources on the host. Without it the
+      # worker assumes identical paths (only correct outside a container).
+      - SANDBOX_HOST_WORKSPACE_ROOT=${RAIVISOX_WORKSPACE_DIR:?RAIVISOX_WORKSPACE_DIR is required}/tasks
       # Run sandbox containers as the API's uid/gid so files they write stay
       # readable by the API that serves the artifacts.
       - SANDBOX_CONTAINER_USER=1000:1000

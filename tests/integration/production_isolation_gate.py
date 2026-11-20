@@ -145,10 +145,21 @@ async def _client_main() -> int:
             output_limit_bytes=1_048_576,
         )
 
-    # -- 1. harmless execution ---------------------------------------------
-    res = await sb.run(spec(["python", "-c", "print(2+2)"]))
+    # -- 1. the workspace the sandbox sees is the one the API sees ----------
+    # A canary written on the API side must be readable inside the container:
+    # this is what proves the bind source maps to the same bytes (a wrong
+    # translation binds an empty host directory and the run silently sees
+    # nothing, which is exactly the failure this check exists to catch).
+    first = spec(["true"])
+    Path(first.cwd, "canary.txt").write_text("canary", encoding="utf-8")
+    res = await sb.run(spec([
+        "python", "-c", "print(open('canary.txt').read());print(2+2)",
+    ], sub=Path(first.cwd).name))
+    check("the run sees the API's workspace (bind source maps correctly)",
+          res.exit_code == 0 and "canary" in res.stdout,
+          f"exit={res.exit_code} out={res.stdout!r} err={res.stderr[-300:]!r}")
     check("harmless run executes and returns bounded stdout",
-          res.exit_code == 0 and res.stdout.strip() == "4",
+          res.exit_code == 0 and res.stdout.strip().endswith("4"),
           f"exit={res.exit_code} out={res.stdout!r} err={res.stderr[-300:]!r}")
     check("worker reports enforced isolation flags",
           {"network_deny", "cap_drop_all", "no_new_privileges",
@@ -448,8 +459,8 @@ def host_main() -> int:
         "-e", f"SANDBOX_WORKER_TOKEN={TOKEN}",
         "-e", f"SANDBOX_WORKER_WORKSPACE_ROOT={WORK_ROOT}",
         # The daemon resolves bind sources on the HOST, so the worker gets the
-        # host location of the directory it sees at /app/workspaces.
-        "-e", f"SANDBOX_HOST_WORKSPACE_ROOT={workspace}",
+        # host location of exactly what it sees at SANDBOX_WORKER_WORKSPACE_ROOT.
+        "-e", f"SANDBOX_HOST_WORKSPACE_ROOT={workspace}/tasks",
         "-e", "SANDBOX_CONTAINER_USER=1000:1000",
         "-e", f"SANDBOX_CONTAINER_IMAGE={SANDBOX_DIGEST}",
         "-e", "SANDBOX_WORKER_MAX_MEMORY_BYTES=536870912",

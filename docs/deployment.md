@@ -386,9 +386,12 @@ failure, and the gate asserts no `raivisox-sbx-*` container survives.
 `RAIVISOX_WORKSPACE_DIR` is therefore a required **absolute host directory**
 (not a named volume), mounted at `/app/workspaces` in the API and the worker,
 and the worker translates that prefix back to the host path through
-`SANDBOX_HOST_WORKSPACE_ROOT` (`ContainerSandbox.host_bind_path`). Without the
-translation the daemon would silently create an empty host directory and the
-run would see an empty workspace.
+`SANDBOX_HOST_WORKSPACE_ROOT` — the host path of **exactly**
+`SANDBOX_WORKER_WORKSPACE_ROOT` (i.e. `${RAIVISOX_WORKSPACE_DIR}/tasks`, not
+its parent) — via `ContainerSandbox.host_bind_path`. Without the translation
+the daemon silently creates an empty host directory and the run sees an empty
+workspace; the gate asserts the opposite (a canary written by the API is read
+inside the container).
 
 **Configuration.**
 
@@ -398,7 +401,7 @@ run would see an empty workspace.
 | `SANDBOX_WORKER_URL` | API | e.g. `http://sandbox-worker:8100` (no default) |
 | `SANDBOX_WORKER_TOKEN` | API + worker | shared HMAC key, ≥32 chars, same value |
 | `SANDBOX_WORKER_WORKSPACE_ROOT` | worker | `/app/workspaces/tasks` |
-| `SANDBOX_HOST_WORKSPACE_ROOT` | worker | host path of the same directory (bind-source translation) |
+| `SANDBOX_HOST_WORKSPACE_ROOT` | worker | host path of `SANDBOX_WORKER_WORKSPACE_ROOT` (bind-source translation) |
 | `SANDBOX_CONTAINER_IMAGE` | worker | digest-pinned sandbox image |
 | `SANDBOX_CONTAINER_USER` | worker | `1000:1000` — matches the API uid |
 | `SANDBOX_WORKER_MAX_*` | worker | timeout / memory / pids / concurrency ceilings |

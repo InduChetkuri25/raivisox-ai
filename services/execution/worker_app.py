@@ -135,8 +135,9 @@ class WorkerState:
         # The runtime daemon resolves bind sources on the HOST. This service is
         # itself a container, so its own workspace path is not a host path:
         # translate the prefix when the operator tells us where the directory
-        # actually lives (`SANDBOX_HOST_WORKSPACE_ROOT`). Without it the paths
-        # are assumed identical (worker running directly on the host).
+        # actually lives (`SANDBOX_HOST_WORKSPACE_ROOT` = the host path OF
+        # SANDBOX_WORKER_WORKSPACE_ROOT, not of its parent). Without it the
+        # paths are assumed identical (worker running directly on the host).
         host_root = (os.environ.get("SANDBOX_HOST_WORKSPACE_ROOT") or "").strip()
         bind_map = (self.workspace_root, host_root) if host_root else None
         if host_root and not os.path.isabs(host_root):
