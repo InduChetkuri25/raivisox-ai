@@ -493,6 +493,9 @@ def host_main() -> int:
         API_IMAGE, "python", "/gate.py", "--in-container",
     ]
     proc = run(client_cmd, check_rc=False, timeout=900)
+    # Always show the per-check evidence: the client's PASS/FAIL lines are the
+    # record of what was actually measured inside the boundary.
+    print(proc.stdout or "", flush=True)
     check("API→worker end-to-end client scenarios", proc.returncode == 0,
           f"rc={proc.returncode}")
 
