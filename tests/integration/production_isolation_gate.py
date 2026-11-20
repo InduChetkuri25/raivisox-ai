@@ -42,7 +42,10 @@ import time
 import uuid
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
+# Host mode runs from tests/integration/; container mode mounts this file at
+# /gate.py, where there is no repository — /. Only host mode uses REPO.
+_SELF = Path(__file__).resolve()
+REPO = _SELF.parents[2] if len(_SELF.parents) > 2 else Path("/app")
 API_IMAGE = "raivisox-gate-api:local"
 WORKER_IMAGE = "raivisox-gate-worker:local"
 NETWORK = "raivisox-gate-net"
