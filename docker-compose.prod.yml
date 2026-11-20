@@ -13,9 +13,25 @@
 #   RAIVISOX_LLM_BASE_URL OpenAI-compatible endpoint, e.g.
 #                         http://ollama:11434/v1 (enable the ollama profile)
 #                         or https://api.openai.com/v1 with RAIVISOX_LLM_API_KEY
-#   SANDBOX_BACKEND       explicit sandbox choice — 'container' (isolated) or
+#   SANDBOX_BACKEND       explicit sandbox choice — 'worker' (recommended:
+#                         the dedicated sandbox-worker service, the API has no
+#                         runtime access), 'container' (isolated, but requires
+#                         a runtime reachable from the API container), or
 #                         'process' + SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1
-#                         (documented NON-isolated posture). See docs/deployment.md §10.
+#                         (documented NON-isolated posture).
+#                         See docs/deployment.md §10.
+#   SANDBOX_WORKER_TOKEN  shared HMAC key for the API→worker hop
+#                         (openssl rand -hex 32). Required when
+#                         SANDBOX_BACKEND=worker; the worker refuses to start
+#                         without it. Never shared with anything else.
+#
+# Optional .env variables:
+#   RAIVISOX_WORKSPACE_DIR  absolute host directory for task workspaces,
+#                         e.g. /srv/raivisox/workspaces (REQUIRED). It is
+#                         mounted at /app/workspaces in the API and the
+#                         worker; the worker translates the bind source back
+#                         to this host path because the runtime daemon
+#                         resolves binds on the host.
 #
 # Optional profiles:  --profile ollama   (bundled local provider)
 
@@ -36,9 +52,14 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # The API imports the repo-level services.* and integrations.* packages, so
+  # the build context is the REPOSITORY ROOT (the image layout is documented
+  # in apps/api/Dockerfile). A ./apps/api context cannot import its own code.
   api:
     build:
-      context: ./apps/api
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: raivisox-api:${RAIVISOX_IMAGE_TAG:-prod}
     container_name: raivisox-api
     environment:
       - ENVIRONMENT=production
@@ -58,15 +79,24 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       # SECURITY (H1): task-generated code is never run unconfined by
       # default in production. Choose the backend explicitly:
-      #   SANDBOX_BACKEND=container  → one isolated container per execution
-      #                                (this service must be able to reach a
-      #                                container runtime; see docs/deployment.md §10)
+      #   SANDBOX_BACKEND=worker     → the dedicated sandbox-worker service
+      #                                runs one isolated container per
+      #                                execution. RECOMMENDED: this API
+      #                                container has NO runtime access.
+      #   SANDBOX_BACKEND=container  → one isolated container per execution,
+      #                                started from THIS process (needs a
+      #                                reachable runtime here; see §10)
       #   SANDBOX_BACKEND=process + SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1
       #                              → the documented NON-isolated posture
       # Do NOT mount /var/run/docker.sock (or any runtime socket) into this
-      # service: that grants host-wide control to the API process.
-      - SANDBOX_BACKEND=${SANDBOX_BACKEND:?SANDBOX_BACKEND is required in production — 'container' (isolated) or 'process' with SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1 (documented non-isolated posture); see docs/deployment.md §10}
+      # service: that grants host-wide control to the API process. The socket
+      # belongs to `sandbox-worker` only.
+      - SANDBOX_BACKEND=${SANDBOX_BACKEND:?SANDBOX_BACKEND is required in production — 'worker' (recommended), 'container' (isolated in-process runtime) or 'process' with SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1 (documented non-isolated posture); see docs/deployment.md §10}
       - SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=${SANDBOX_ALLOW_PROCESS_IN_PRODUCTION:-}
+      # Only used when SANDBOX_BACKEND=worker; the policy refuses that backend
+      # without both values, so a half-configured boundary cannot boot.
+      - SANDBOX_WORKER_URL=${SANDBOX_WORKER_URL:-http://sandbox-worker:8100}
+      - SANDBOX_WORKER_TOKEN=${SANDBOX_WORKER_TOKEN:-}
       # Artifact storage limits (bytes / counts) — see docs/deployment.md
       - MAX_ARTIFACT_SIZE_BYTES=${MAX_ARTIFACT_SIZE_BYTES:-52428800}
       - MAX_ARTIFACTS_PER_TASK=${MAX_ARTIFACTS_PER_TASK:-1000}
@@ -77,9 +107,14 @@ services:
       - "8000:8000"
     volumes:
       # Artifact storage (task workspaces) — survives container recreation.
-      - workspace_data:/app/workspaces
+      # A HOST directory, not a named volume: the sandbox container is started
+      # through the worker's runtime socket, so the worker must be able to name
+      # the same bytes by their host path (docs/deployment.md §10.7).
+      - ${RAIVISOX_WORKSPACE_DIR:?RAIVISOX_WORKSPACE_DIR is required — absolute host directory for task workspaces}:/app/workspaces
     depends_on:
       postgres:
+        condition: service_healthy
+      sandbox-worker:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
@@ -87,6 +122,54 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    restart: unless-stopped
+
+  # The execution boundary (docs/deployment.md §10.7). This is the ONLY
+  # service with container-runtime access, and it holds nothing else: no
+  # DATABASE_URL, no SECRET_KEY, no provider key. It answers a narrow,
+  # HMAC-authenticated protocol and runs exactly one throwaway, non-root,
+  # network-denied, read-only-rootfs, cap-dropped container per request.
+  #
+  # The socket is host-wide control. That is unavoidable for any design that
+  # starts containers, which is why it is confined to this service instead of
+  # the API. If the host can provide a rootless or remote runtime, point
+  # DOCKER_HOST at it and drop this mount.
+  sandbox-worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    image: raivisox-sandbox-worker:${RAIVISOX_IMAGE_TAG:-prod}
+    container_name: raivisox-sandbox-worker
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # The API and the worker must hold the SAME key; nothing else is shared.
+      - SANDBOX_WORKER_TOKEN=${SANDBOX_WORKER_TOKEN:-}
+      - SANDBOX_WORKER_WORKSPACE_ROOT=/app/workspaces/tasks
+      # Where that directory lives on the HOST (the runtime daemon resolves
+      # bind sources there). Without it the worker assumes identical paths.
+      - SANDBOX_HOST_WORKSPACE_ROOT=${RAIVISOX_WORKSPACE_DIR:?RAIVISOX_WORKSPACE_DIR is required}
+      # Run sandbox containers as the API's uid/gid so files they write stay
+      # readable by the API that serves the artifacts.
+      - SANDBOX_CONTAINER_USER=1000:1000
+      # Digest-pinned sandbox image (docs/sandbox-design.md §8).
+      - SANDBOX_CONTAINER_IMAGE=${SANDBOX_CONTAINER_IMAGE:-python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1}
+      - SANDBOX_WORKER_MAX_TIMEOUT_S=${SANDBOX_WORKER_MAX_TIMEOUT_S:-300}
+      - SANDBOX_WORKER_MAX_MEMORY_BYTES=${SANDBOX_WORKER_MAX_MEMORY_BYTES:-536870912}
+      - SANDBOX_WORKER_MAX_PIDS=${SANDBOX_WORKER_MAX_PIDS:-64}
+      - SANDBOX_WORKER_MAX_CONCURRENCY=${SANDBOX_WORKER_MAX_CONCURRENCY:-2}
+    volumes:
+      # Shared with the API. The run's own subtree is the ONLY host path the
+      # sandbox container sees; artifact bytes never leave this directory.
+      - ${RAIVISOX_WORKSPACE_DIR:?RAIVISOX_WORKSPACE_DIR is required — absolute host directory for task workspaces}:/app/workspaces
+      # The single runtime socket, read-write (a socket cannot be made read-
+      # only meaningfully). Confined to this service by design.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/readyz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
 
   web:
@@ -119,5 +202,4 @@ services:
 
 volumes:
   postgres_data:
-  workspace_data:
   ollama_data:

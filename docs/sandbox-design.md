@@ -561,3 +561,10 @@ workspace mount) and the final verdict — lives in
   the `process` default. This is a selection policy only — it does not add
   isolation, and the deployment decision (dedicated sandbox executor vs. a
   remote rootless runtime) is recorded in `docs/deployment.md` §10.
+- The deployment decision is now implemented: `SANDBOX_BACKEND=worker` uses
+  the dedicated sandbox service (`services/execution/worker_app.py`,
+  `apps/worker/Dockerfile`), so the API process holds no container-runtime
+  access. The interface is unchanged — the worker is an `ExecutionSandbox`
+  client at the API end and `ContainerSandbox` at the execution end. See
+  `docs/deployment.md` §10.7 for the trust boundary, the signed protocol and
+  the isolation guarantees the CI gate measures.

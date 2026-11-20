@@ -1,0 +1,50 @@
+# Build context is the REPOSITORY ROOT (see apps/api/Dockerfile and
+# apps/worker/Dockerfile). Exclude everything neither image needs so the
+# context stays small and no development material or secret is copied in.
+.git
+.gitignore
+.github
+.freebuff
+.cloud-attachments
+.pytest_cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.venv
+venv
+
+# Never bake configuration or local data into an image.
+.env
+.env.*
+*.db
+*.sqlite3
+*.log
+*.zip
+*.json.tmp
+
+# Tests, docs and local verification scripts are not part of the runtime.
+tests
+docs
+_bench_artifacts
+_benchmark_results.json
+_benchmark_models.py
+_live_verify_prod.py
+_live_verify_retention.py
+_pg_live_gate.py
+_serve_preview.py
+
+# Frontend is built by its own image (apps/web/Dockerfile).
+apps/web
+**/node_modules
+
+# Local workspaces/artifacts never ship.
+workspaces
+apps/api/workspaces
+**/workspaces/*
+
+# Local tooling leftovers.
+exec*.json
+steps.json
+live*.json
+reg.json
+f5671f4c-*.zip

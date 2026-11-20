@@ -246,6 +246,7 @@ def build_run_argv(
     python_bin: str,
     container_cwd: str,
     name: str,
+    host_writable: str | None = None,
 ) -> list[str]:
     """The exact ``docker/podman run`` command — pure and unit-testable.
 
@@ -258,6 +259,12 @@ def build_run_argv(
     """
     env = build_container_env(spec)
     writable = os.path.abspath(spec.workspace_writable or spec.cwd)
+    # The bind SOURCE is interpreted by the runtime daemon, i.e. on the HOST.
+    # When the caller of this backend is itself a container that reaches a
+    # host runtime (the dedicated sandbox worker), the in-container path is
+    # not a host path; the caller passes the translated one. Without a
+    # translation the source is the path as seen here (single-host default).
+    bind_source = host_writable or writable
     cmd: list[str] = [
         runtime_exe, "run",
         "--rm",
@@ -284,7 +291,7 @@ def build_run_argv(
         cmd += ["--ulimit", f"cpu={spec.cpu_seconds}:{spec.cpu_seconds + 1}"]
     if spec.fsize_bytes is not None:
         cmd += ["--ulimit", f"fsize={spec.fsize_bytes}:{spec.fsize_bytes}"]
-    cmd += ["-v", f"{writable}:{CONTAINER_WORKSPACE}:rw"]
+    cmd += ["-v", f"{bind_source}:{CONTAINER_WORKSPACE}:rw"]
     for key in sorted(env):
         cmd += ["-e", f"{key}={env[key]}"]
     cmd.append(image)
@@ -420,7 +427,8 @@ class ContainerSandbox:
                  user: str | None = None,
                  quota: "SandboxQuota | None" = None,
                  budget: "ExecutionBudget | None" = None,
-                 workspace_quota: WorkspaceQuota | None = None) -> None:
+                 workspace_quota: WorkspaceQuota | None = None,
+                 bind_prefix_map: tuple[str, str] | None = None) -> None:
         # V2 Phase 5: optional spec-level quota + cumulative budget, same
         # gates as the process backend (additive; None keeps Phase 4 exact).
         self._quota = quota
@@ -437,6 +445,25 @@ class ContainerSandbox:
                                                  "").strip()
                                   or _DEFAULT_CONTAINER_PYTHON))
         self._user = user or _default_user()
+        # (in-container prefix, host prefix) for the workspace bind, used when
+        # this backend runs inside a container that talks to a HOST runtime
+        # (the dedicated worker). None = the paths are the same (single host).
+        self._bind_prefix_map = bind_prefix_map
+
+    def host_bind_path(self, path: str) -> str:
+        """Translate an in-container workspace path to the daemon's host path.
+
+        Only rewrites under the configured prefix; anything else is returned
+        unchanged (and will fail the runtime's own validation rather than
+        silently bind an unrelated directory).
+        """
+        if not self._bind_prefix_map:
+            return path
+        inside, outside = self._bind_prefix_map
+        inside = inside.rstrip("/")
+        if path == inside or path.startswith(inside + "/"):
+            return (outside.rstrip("/") + path[len(inside):]) or "/"
+        return path
 
     # -- capability reporting ------------------------------------------------
 
@@ -586,6 +613,7 @@ class ContainerSandbox:
         cmd = build_run_argv(
             spec, runtime_exe=exe, image=pinned_image, user=self._user,
             python_bin=self._python_bin, container_cwd=container_cwd, name=name,
+            host_writable=self.host_bind_path(writable),
         )
         enforced = self._enforced_for(spec)
         if enforcer is not None:

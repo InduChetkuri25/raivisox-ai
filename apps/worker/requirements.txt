@@ -1,0 +1,8 @@
+# Sandbox worker runtime dependencies — deliberately minimal.
+#
+# No database driver, no auth library, no LLM client: the worker validates a
+# signed execution request and runs one container. Adding a dependency here
+# widens what the runtime-facing service can do; justify it in review.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.6

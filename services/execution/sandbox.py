@@ -660,6 +660,11 @@ def build_default_sandbox() -> ExecutionSandbox:
     - ``container``: the Phase 4 ``ContainerSandbox``. It fails honestly at
       ``run()`` when no container runtime is reachable — the process backend
       is NEVER silently substituted.
+    - ``worker``: the dedicated execution service
+      (:class:`services.execution.remote_sandbox.WorkerSandbox`). The API
+      never receives runtime access; a signed request goes to the worker,
+      which owns the runtime. An endpoint or key that is missing is a
+      configuration error, never a local fallback.
     - unset in production, or anything else: ``SandboxConfigError`` (a
       ``ValueError``) — a configuration error, not a license to pick another
       backend.
@@ -673,6 +678,12 @@ def build_default_sandbox() -> ExecutionSandbox:
         if notice:
             _log.warning(notice)
         return ProcessSandbox(workspace_quota=workspace_quota)
+    if backend == "worker":
+        from services.execution.remote_sandbox import WorkerSandbox
+
+        # validate_worker_endpoint() already ran inside resolve_backend_name;
+        # from_env repeats it so a direct construction cannot skip the check.
+        return WorkerSandbox.from_env()
     from services.execution.container_sandbox import ContainerSandbox
 
     return ContainerSandbox(workspace_quota=workspace_quota)

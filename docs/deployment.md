@@ -1,15 +1,17 @@
 # RAIVISOX AI — Production Deployment
 
-This is the documented production path. It uses Docker Compose with four
-services (PostgreSQL, API, frontend, optional Ollama) and no other
-infrastructure.
+This is the documented production path. It uses Docker Compose with five
+services (PostgreSQL, API, sandbox worker, frontend, optional Ollama) and no
+other infrastructure.
 
 > **Verification status:** the application and its PostgreSQL path are
 > live-verified with real PostgreSQL 16.9 under `ENVIRONMENT=production`
-> (see §5 and `CHANGELOG.md`). The **Docker container stack itself has
-> not been started in the release environment** (Docker unavailable
-> there); the compose files and Dockerfiles are reviewed and consistent
-> with the verified configuration.
+> (see §5 and `CHANGELOG.md`). Both production images are built from a clean
+> checkout on Linux CI, and the `production-isolation-gate` job starts the API
+> image and the sandbox worker and runs the real execution path through them
+> (§10.7). The **full compose stack has not been started as one unit** in the
+> release environment (no Docker there); the gates above exercise the same
+> images, network hop and sandbox flags individually.
 
 ## 1. Requirements
 
@@ -117,7 +119,8 @@ secrets, URLs or filesystem paths.
 Enforced at registration (size, per-task count — a violation fails the
 registration honestly, never fabricates or hides) and at bundle download
 (entry count, byte total — HTTP 413 with a stable message). Defaults in
-§2. Storage lives in the `workspace_data` volume (`/app/workspaces`).
+§2. Storage lives in the host directory `${RAIVISOX_WORKSPACE_DIR:-./data/workspaces}`,
+mounted at `/app/workspaces` (§10.7 explains why it must be a host path).
 These limits are independent of retention: retention governs how long
 **superseded history bytes** survive; the limits govern what may be
 registered and bundled at all.
@@ -255,6 +258,8 @@ Rlimits and timeouts bound a run; they do not confine it.
 | **production** | `process` | **refused** unless `SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1` |
 | **production** | `process` + acknowledgement | allowed; logs an explicit UNCONFINED warning |
 | production | `container` | allowed; each run fails honestly when no runtime is reachable |
+| **production** | `worker` | **recommended**: signed requests to the dedicated `sandbox-worker` (§10.7) |
+| production | `worker` without URL or key | **startup refusal** — the boundary cannot be half-configured |
 | any | unknown or explicitly empty | configuration error — never a substitute backend |
 
 These are deterministic configuration checks (no runtime required): they
@@ -268,7 +273,7 @@ prove the selection, **not** isolation. `docker-compose.prod.yml` uses
 | A. Process backend in the API container | none (§10.1) | lowest | any | falls open to shared uid/net | rejected as default; acknowledged posture only |
 | B. Container backend with the runtime socket mounted into the API | per-container flags, plus a root-equivalent socket in the API | medium | Docker/Podman hosts | runtime outage stops executions (honest) | **rejected** — one API compromise would mean host-wide control |
 | B′. Container backend via a remote/rootless runtime (podman-remote over SSH, or a runtime-only sidecar with a narrow API) | same as B without a local socket | medium-high | Linux | honest fail-closed | acceptable interim on one host |
-| C. Dedicated sandbox execution service (API enqueues → isolated worker runs one throwaway container per run) | strongest: the API never touches a runtime | high (queue, worker identity, storage handoff, image supply chain) | any | queue/worker outage fails closed, retryable | **recommended target** |
+| C. Dedicated sandbox execution service (API sends a signed request → isolated worker runs one throwaway container per run) | strongest: the API never touches a runtime | high (worker identity, storage handoff, image supply chain) | any | worker outage fails closed, retryable | **implemented — §10.7** |
 
 Mounting `/var/run/docker.sock` lets the containerised API start any
 container, mount the host filesystem and reach other containers — effective
@@ -278,30 +283,162 @@ file mounts no runtime socket.
 
 ### 10.5 Recommendation and status
 
-- **Done here:** the fail-closed configuration above, the compose requirement,
-  and this documentation of the real guarantees.
-- **Needs owner approval:** option C (or B′ as an interim on a single Linux
-  host). It requires infrastructure decisions — where the executor runs, how
-  it authenticates, which digest-pinned image it uses and who refreshes it,
-  and how artifacts/results are handed back.
-- **Until then:** production runs either with `SANDBOX_BACKEND=container` and
-  honest per-run failures (no execution without a reachable runtime), or with
-  the acknowledged `process` posture whose limits are listed above.
+- **Implemented:** the fail-closed configuration above, option C as the
+  dedicated `sandbox-worker` service (§10.7), and the production image
+  packaging fix (§10.3a).
+- **Recommended deployment:** `SANDBOX_BACKEND=worker`. The API container has
+  no runtime client and no runtime socket; the worker is the only service that
+  can start containers.
+- **Supported alternatives:** `SANDBOX_BACKEND=container` (isolated, but the
+  runtime must be reachable from the API container — on a single Linux host
+  that usually means the socket back in the API, which §10.4 rejects), or the
+  acknowledged `process` posture whose limits are listed above.
 
-H1 is **partially mitigated**: the silent insecure default is gone and cannot
-return without a deliberate, logged acknowledgement, but no isolation
-architecture is deployed and none is claimed.
+H1 is **mitigated for the supported architecture**: the silent insecure
+fallback is gone, and the deployment that ships now carries a real
+namespace-level boundary whose behaviour is measured by CI (not asserted from
+configuration). It is **not closed** for every host: see the limitations in
+§10.8 (in particular a worker that is itself compromised still holds the host
+runtime).
+
+### 10.3a Production image packaging (fixed)
+
+The API imports the repository-level `services.*` and `integrations.*`
+packages, but the shipped build context was `./apps/api`, which contains
+neither — so the produced image could not import its own application. Both
+images now build from the **repository root**:
+
+```
+docker build -f apps/api/Dockerfile    -t raivisox-api .
+docker build -f apps/worker/Dockerfile -t raivisox-sandbox-worker .
+```
+
+`apps/api/Dockerfile` copies `services/`, `integrations/`, `apps/api/app`,
+`apps/api/alembic` and `apps/api/alembic.ini` — no blanket context copy, so
+`.dockerignore` keeps tests, docs, `.env`, databases and local workspaces out
+of the image. The `production-isolation-gate` CI job builds both images from a
+clean checkout and asserts imports, production startup validation and the
+absence of development material inside them.
 
 ### 10.6 Remaining limitations
 
-- This change enforces a policy decision; it does not itself isolate anything.
-- Container-backend guarantees are verified only where a runtime exists (the
-  Linux `container-gate` CI job). No isolation is claimed for a runtime-less
-  or Windows host.
-- **Open packaging blocker (not fixed here):** the API image builds from
-  `./apps/api`, while `app.main` imports the repository-level `services.*` and
-  `integrations.*` packages, which that build context does not contain. The
-  documented compose image therefore cannot boot as written; fixing the build
-  context belongs to the owner-approved deployment work in §10.5.
-- No production container stack has been started and verified here; see the
-  verification note at the top of this document.
+- This change enforces a policy decision and ships the option-C boundary; what
+  the boundary actually enforces is reported per run (`SandboxResult.enforced`)
+  and measured by the gate — never inferred from configuration.
+- Container guarantees are verified only where a runtime exists (Linux CI). No
+  isolation is claimed for a runtime-less or Windows host.
+
+### 10.7 The dedicated execution service (option C)
+
+**Trust boundary.** Two processes, one shared secret, no shared database:
+
+```
+  API container                        sandbox-worker container
+  ─────────────                        ────────────────────────
+  DB credentials, SECRET_KEY,          SANDBOX_WORKER_TOKEN only
+  provider keys, HTTP surface    ──▶   no DB URL, no app secret,
+  no runtime client,             HMAC   no provider key
+  no runtime socket                    /var/run/docker.sock (only here)
+                                       │
+                                       └─▶ throwaway sandbox container
+                                           (non-root, --network none,
+                                            read-only rootfs, cap-drop ALL,
+                                            no-new-privileges, pinned digest)
+```
+
+**Flow.** `python_exec` / `shell_exec` / codegen / DoD → `build_default_sandbox()`
+→ `WorkerSandbox.run(spec)` → signed `POST /v1/execute` → the worker validates
+and clamps, runs one container through `ContainerSandbox`, returns bounded
+stdout/stderr, exit status, timeout/kill reason, the flags actually enforced,
+and a bounded artifact manifest (path, size, sha256 — no bytes; the volume is
+shared) → the API reads artifacts through its own containment check.
+
+**Authentication.** HMAC-SHA256 over `timestamp\n nonce\n sha256(body)` with a
+≥32-character shared key, a ±300 s clock window and a bounded nonce cache: a
+captured request cannot be replayed, and an unsigned call gets 401 with no
+detail. The key is the only thing the two services share.
+
+**Provenance.** `task_id` / `run_id` / `step_id` are taken from the
+server-built sandbox environment (the execution context), never from a tool
+parameter; the client refuses to send a request without them, and the worker
+validates their shape and echoes them back. Artifact ownership follows the
+run's own scope, which the worker contains against its workspace root.
+
+**What a caller cannot do.** The request has no network, privilege or
+capability fields at all. The worker always passes `--network none`,
+`--cap-drop ALL`, `--security-opt no-new-privileges`, `--read-only`, a
+non-root `--user`, `--pids-limit`, `--memory`/`--memory-swap`, `--ulimit
+cpu=`/`fsize=`, and a single rw bind of the run's own subtree. Timeout, CPU,
+memory, pid, fsize and output caps are clamped to the worker's ceilings — a
+caller may ask for less, never more.
+
+**Idempotency.** A `request_id` executes at most once. A duplicate replays the
+stored response (`replayed: true`); one already running answers 409; the store
+is bounded (512 entries, 1 h TTL). The API retries only on a transport error,
+and reuses the same request id for that retry.
+
+**Cancellation and cleanup.** `POST /v1/execute/{id}/cancel` cancels the run;
+`ContainerSandbox` force-removes the container on cancellation, timeout and
+failure, and the gate asserts no `raivisox-sbx-*` container survives.
+
+**Workspace requirement.** The runtime daemon resolves bind sources on the
+**host**, so a path inside the worker container is not usable as a bind source.
+`RAIVISOX_WORKSPACE_DIR` is therefore a required **absolute host directory**
+(not a named volume), mounted at `/app/workspaces` in the API and the worker,
+and the worker translates that prefix back to the host path through
+`SANDBOX_HOST_WORKSPACE_ROOT` (`ContainerSandbox.host_bind_path`). Without the
+translation the daemon would silently create an empty host directory and the
+run would see an empty workspace.
+
+**Configuration.**
+
+| Variable | Service | Meaning |
+|---|---|---|
+| `SANDBOX_BACKEND=worker` | API | selects the worker client |
+| `SANDBOX_WORKER_URL` | API | e.g. `http://sandbox-worker:8100` (no default) |
+| `SANDBOX_WORKER_TOKEN` | API + worker | shared HMAC key, ≥32 chars, same value |
+| `SANDBOX_WORKER_WORKSPACE_ROOT` | worker | `/app/workspaces/tasks` |
+| `SANDBOX_HOST_WORKSPACE_ROOT` | worker | host path of the same directory (bind-source translation) |
+| `SANDBOX_CONTAINER_IMAGE` | worker | digest-pinned sandbox image |
+| `SANDBOX_CONTAINER_USER` | worker | `1000:1000` — matches the API uid |
+| `SANDBOX_WORKER_MAX_*` | worker | timeout / memory / pids / concurrency ceilings |
+| `RAIVISOX_WORKSPACE_DIR` | compose | host path for task workspaces |
+
+**Verified by CI (`production-isolation-gate`).** Built images from a clean
+checkout; imports and production startup validation inside the image; a real
+API-image → worker → container execution; non-root uid; network denial;
+read-only rootfs; no host/worker filesystem visibility; only the run's own
+subtree mounted; memory and timeout termination; bounded output; artifact
+manifest; 401 for unsigned/stale/replayed requests; replay refusal; duplicate
+request id executed once; cancellation; no leftover containers; no runtime
+socket or client in the API container; and no `ProcessSandbox` fallback when
+the worker is unreachable.
+
+### 10.8 Open limitations after this change
+
+- **The worker holds the host runtime.** Any design that starts containers
+  does. The socket is now confined to a service with no database, application
+  or provider secrets and a narrow validated protocol, but a compromised
+  worker is still root-equivalent on the host. Use a rootless runtime, a
+  remote runtime (`DOCKER_HOST` to a dedicated VM) or a dedicated host to
+  reduce this further; the compose file mounts the socket only in that service.
+- **The worker runs as root inside its own container** because the runtime
+  socket is root-owned. The containers it starts are non-root (uid 1000).
+- **Artifact bytes cross no boundary** — the API and worker share a host
+  directory, so the manifest is a statement about paths the API re-validates.
+  The worker never transmits file contents.
+- **Idempotency state is in memory.** A worker restart forgets completed
+  request ids; a retry after a restart could execute again. The API's retry is
+  limited to transport failures within one call, so the window is small but
+  non-zero.
+- **No queue.** Concurrency is capped by a semaphore and excess work answers
+  429. Sustained load needs an external queue, which is out of scope here.
+- **Base images are tag-pinned, not digest-pinned** (`python:3.12-slim`,
+  `docker:27-cli`); the *sandbox* image is digest-pinned and verified per run
+  by `services/execution/image_pins.py`. Pin the build bases too if your
+  supply-chain policy requires it.
+- **The LLM-driven task pipeline is not exercised in CI** (no model there):
+  the gate runs the same sandbox doorway the adapters use, not a generated
+  program.
+- **Verified on Linux only**, with a real Docker daemon; no isolation is
+  claimed for a runtime-less or Windows host.

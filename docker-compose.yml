@@ -41,8 +41,10 @@ services:
   # FastAPI Backend
   api:
     build:
-      context: ./apps/api
-      dockerfile: Dockerfile
+      # Repo root: the API imports the repo-level services.* / integrations.*
+      # packages (see apps/api/Dockerfile).
+      context: .
+      dockerfile: apps/api/Dockerfile
     container_name: raivisox-api
     environment:
       - APP_NAME=RAIVISOX AI API
@@ -67,6 +69,10 @@ services:
         condition: service_healthy
     volumes:
       - ./apps/api:/app
+      # Repo-level packages the API imports; mounted so --reload keeps working
+      # with the same layout the production image uses.
+      - ./services:/app/services
+      - ./integrations:/app/integrations
     command: >
       sh -c "pip install -r requirements.txt &&
              alembic upgrade head &&

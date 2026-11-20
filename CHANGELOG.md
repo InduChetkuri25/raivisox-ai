@@ -100,14 +100,40 @@ release-blocker review: none found) and the PostgreSQL Live Gate passed
   shown → real ZIP download via UI → logout → re-login with persisted
   state.
 
+### Security — production execution boundary (V3 Phase 1 audit, H1)
+
+- **Explicit sandbox decision.** Production refuses to boot without
+  `SANDBOX_BACKEND`; the unconfined `process` backend is refused unless the
+  operator acknowledges it (`SANDBOX_ALLOW_PROCESS_IN_PRODUCTION=1`, logged as
+  an explicit UNCONFINED warning). See `docs/deployment.md` §10.
+- **Dedicated sandbox execution service (option C).** New `sandbox-worker`
+  service (`apps/worker/Dockerfile`, `services/execution/worker_app.py`) is the
+  only process with container-runtime access. The API sends HMAC-signed
+  requests (`timestamp + nonce + body digest`, ±300 s window, replay refused)
+  with server-derived `task_id`/`run_id`/`step_id`; the worker clamps limits and
+  always runs one throwaway container with `--network none`, `--cap-drop ALL`,
+  `no-new-privileges`, a read-only rootfs, a non-root uid, pid/memory/cpu/fsize
+  caps, a single rw bind of the run's own subtree and a digest-pinned image.
+  `request_id` idempotency means a retried request never executes twice.
+- **Production image packaging fixed.** Both images now build from the
+  repository root (`docker build -f apps/api/Dockerfile .`), so the API image
+  contains the `services.*` and `integrations.*` packages it imports; a
+  `.dockerignore` keeps tests, docs, `.env` and databases out.
+- **CI gate:** `production-isolation-gate` builds the images and runs the real
+  API-image → worker → container path, including network denial, read-only
+  rootfs, workspace-scope, memory/timeout termination, cancellation, 401s for
+  forged/stale/replayed requests and no `ProcessSandbox` fallback.
+
 ### Not claimed / known limitations
 
-- **Docker/Compose is NOT verified in this environment** — Docker is
-  unavailable on the release host; `docker-compose.prod.yml` and both
-  Dockerfiles are reviewed and consistent with the verified production
-  configuration, but the container stack has not been started here. The
-  production path was verified natively (real PostgreSQL 16.9 + uvicorn
-  under `ENVIRONMENT=production`) instead.
+- **The full compose stack is not started as one unit in the release
+  environment** (no Docker there). Both images are built and the API→worker→
+  container path is exercised on Linux CI; the complete five-service stack has
+  been reviewed, not booted end to end.
+- **The worker holds the host runtime socket.** That is inherent to starting
+  containers: a compromised worker is root-equivalent on the host. It holds no
+  database, application or provider secret, and the API holds no runtime
+  access at all (`docs/deployment.md` §10.8).
 - No true mid-pipeline resume (interrupted executions are honestly
   `failed`; re-execution starts fresh).
 - Retention reaps superseded/orphan bytes only; current deliverable

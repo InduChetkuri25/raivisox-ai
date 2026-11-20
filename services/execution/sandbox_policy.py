@@ -33,16 +33,33 @@ from typing import Mapping
 
 __all__ = [
     "BACKENDS",
+    "ISOLATED_BACKENDS",
+    "MIN_WORKER_TOKEN_LEN",
     "PROCESS_ACK_ENV",
     "PRODUCTION_ENVIRONMENTS",
+    "WORKER_TOKEN_ENV",
+    "WORKER_URL_ENV",
     "SandboxConfigError",
     "is_production",
     "process_posture_notice",
     "resolve_backend_name",
+    "validate_worker_endpoint",
 ]
 
-BACKENDS = ("process", "container")
+#: ``worker`` is the dedicated execution-boundary backend (docs §10.7): the
+#: API never receives runtime access; it sends a signed request to the
+#: sandbox worker, which owns the runtime.
+BACKENDS = ("process", "container", "worker")
+#: Backends that put a real kernel/namespace boundary between the API and
+#: task-generated code. ``container`` still requires a runtime in the API
+#: container; ``worker`` moves that runtime to a separate service.
+ISOLATED_BACKENDS = ("container", "worker")
 PRODUCTION_ENVIRONMENTS = ("production",)
+
+WORKER_URL_ENV = "SANDBOX_WORKER_URL"
+WORKER_TOKEN_ENV = "SANDBOX_WORKER_TOKEN"
+#: Minimum HMAC secret length; a short shared key is not a boundary.
+MIN_WORKER_TOKEN_LEN = 32
 
 #: Explicit acknowledgement of the documented non-isolated production posture.
 #: Never a default; see docs/deployment.md §10.
@@ -59,6 +76,50 @@ class SandboxConfigError(ValueError):
     that already handle a configuration error keep working.
     """
 
+
+def validate_worker_endpoint(url: str, token: str) -> None:
+    """Validate the worker backend's endpoint and shared key — fail closed.
+
+    Called by the API-side client AND by the worker's own startup, from the
+    same module, so the two can never disagree about what a usable boundary
+    is. Raises :class:`SandboxConfigError` naming variables, never values.
+    """
+    from urllib.parse import urlsplit
+
+    text = (url or "").strip()
+    if not text:
+        raise SandboxConfigError(
+            f"{WORKER_URL_ENV} is required when SANDBOX_BACKEND=worker "
+            "(e.g. http://sandbox-worker:8100) — there is no default "
+            "execution endpoint"
+        )
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        raise SandboxConfigError(
+            f"{WORKER_URL_ENV} is not a valid URL"
+        ) from None
+    if parts.scheme not in ("http", "https"):
+        raise SandboxConfigError(
+            f"{WORKER_URL_ENV} must use http:// or https://"
+        )
+    if not parts.hostname:
+        raise SandboxConfigError(f"{WORKER_URL_ENV} must name a host")
+    if parts.username or parts.password:
+        raise SandboxConfigError(
+            f"{WORKER_URL_ENV} must not embed credentials; the shared key is "
+            f"sent as an HMAC signature ({WORKER_TOKEN_ENV})"
+        )
+    if not (token or "").strip():
+        raise SandboxConfigError(
+            f"{WORKER_TOKEN_ENV} is required when SANDBOX_BACKEND=worker: the "
+            "API-to-worker hop must be authenticated"
+        )
+    if len((token or "").strip()) < MIN_WORKER_TOKEN_LEN:
+        raise SandboxConfigError(
+            f"{WORKER_TOKEN_ENV} must be at least {MIN_WORKER_TOKEN_LEN} "
+            "characters (generate with: openssl rand -hex 32)"
+        )
 
 def _lookup(environ: Mapping[str, str] | None, name: str) -> tuple[bool, str]:
     """``(present, stripped-value)`` for ``name`` — absent is not empty.
@@ -100,19 +161,29 @@ def resolve_backend_name(environ: Mapping[str, str] | None = None) -> str:
             raise SandboxConfigError(
                 "SANDBOX_BACKEND must be set explicitly when "
                 "ENVIRONMENT=production: task-generated code is never run "
-                "unconfined by default. Set SANDBOX_BACKEND=container to run "
-                "untrusted steps in an isolated container (a reachable "
-                "runtime is required), or acknowledge the documented "
-                f"non-isolated posture with {PROCESS_ACK_ENV}=1 "
-                "(see docs/deployment.md §10)"
+                "unconfined by default. Set SANDBOX_BACKEND=worker for the "
+                "dedicated execution service (recommended; the API never "
+                "touches a runtime), or SANDBOX_BACKEND=container to run "
+                "untrusted steps in an isolated container from the API "
+                "process (a reachable runtime is required), or acknowledge "
+                "the documented non-isolated posture with "
+                f"{PROCESS_ACK_ENV}=1 (see docs/deployment.md §10)"
             )
         return "process"
 
     backend = backend.lower()
     if backend not in BACKENDS:
         raise SandboxConfigError(
-            f"invalid SANDBOX_BACKEND {backend!r}: expected 'process' or 'container'"
+            f"invalid SANDBOX_BACKEND {backend!r}: expected 'process', "
+            "'container' or 'worker'"
         )
+
+    if backend == "worker":
+        # The isolated boundary cannot be half-configured: an endpoint or key
+        # that is missing is a configuration error, never a local fallback.
+        _u_present, url = _lookup(environ, WORKER_URL_ENV)
+        _t_present, token = _lookup(environ, WORKER_TOKEN_ENV)
+        validate_worker_endpoint(url, token)
 
     if production and backend == "process":
         _ack_present, ack = _lookup(environ, PROCESS_ACK_ENV)
@@ -121,6 +192,7 @@ def resolve_backend_name(environ: Mapping[str, str] | None = None) -> str:
                 "SANDBOX_BACKEND=process is refused when ENVIRONMENT=production: "
                 "the process backend denies neither network access nor "
                 "filesystem access for task-generated code. Use "
+                "SANDBOX_BACKEND=worker (dedicated execution service) or "
                 "SANDBOX_BACKEND=container with an isolated runtime, or "
                 "acknowledge the documented non-isolated posture with "
                 f"{PROCESS_ACK_ENV}=1 (see docs/deployment.md §10)"

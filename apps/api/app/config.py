@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     # posture. String (not bool) so an empty value is simply "not given"
     # rather than a parsing error; meaning is decided by the policy module.
     sandbox_allow_process_in_production: str = ""
+    # Dedicated execution service (SANDBOX_BACKEND=worker). The API signs each
+    # request; it never receives container-runtime access. Both values are
+    # required by the policy when that backend is selected — see
+    # docs/deployment.md §10.7.
+    sandbox_worker_url: str = ""
+    sandbox_worker_token: str = ""
 
     # Execution
     default_execution_mode: str = "BALANCED"
@@ -229,6 +235,8 @@ def validate_settings(s: "Settings") -> None:
     # execution can never disagree about which backends are permitted.
     from services.execution.sandbox_policy import (
         PROCESS_ACK_ENV,
+        WORKER_TOKEN_ENV,
+        WORKER_URL_ENV,
         SandboxConfigError,
         resolve_backend_name,
     )
@@ -238,6 +246,10 @@ def validate_settings(s: "Settings") -> None:
         sandbox_env["SANDBOX_BACKEND"] = s.sandbox_backend
     if s.sandbox_allow_process_in_production.strip():
         sandbox_env[PROCESS_ACK_ENV] = s.sandbox_allow_process_in_production
+    if s.sandbox_worker_url.strip():
+        sandbox_env[WORKER_URL_ENV] = s.sandbox_worker_url
+    if s.sandbox_worker_token.strip():
+        sandbox_env[WORKER_TOKEN_ENV] = s.sandbox_worker_token
     try:
         resolve_backend_name(sandbox_env)
     except SandboxConfigError as exc:

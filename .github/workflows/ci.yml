@@ -395,6 +395,50 @@ jobs:
         if: always()
         run: rm -f ./ci_container_gate.db
 
+  # The production isolation gate (docs/deployment.md §10.7). It BUILDS the
+  # shipped images from a clean checkout and runs the real API-image → worker
+  # → sandbox-container path. Unlike the container gate above, it starts the
+  # dedicated worker service, so it also proves the API has no runtime access,
+  # that the worker protocol refuses forged/stale/replayed requests, that a
+  # duplicate request id executes once, and that timeout/cancel leaves no
+  # container behind. A failure here is never skipped — the script raises.
+  production-isolation-gate:
+    name: Production isolation gate (images + worker + live sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prove the container runtime is usable
+        run: |
+          docker version
+          docker info > /dev/null
+
+      - name: Build production images and run the isolation gate
+        run: python tests/integration/production_isolation_gate.py
+        timeout-minutes: 40
+
+      - name: Diagnostics on failure
+        if: always()
+        run: |
+          echo '--- worker logs ---'
+          docker logs raivisox-gate-worker 2>&1 | tail -100 || true
+          echo '--- leftover containers ---'
+          docker ps -a --format '{{.Names}} {{.Status}} {{.Image}}' || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f raivisox-gate-worker 2>/dev/null || true
+          docker network rm raivisox-gate-net 2>/dev/null || true
+          docker ps -aq --filter name=raivisox-sbx- | xargs -r docker rm -f || true
+
   frontend-validation:
     name: Frontend (typecheck + build)
     runs-on: ubuntu-latest

@@ -6,7 +6,7 @@ production deployment.
 | Store | Location (compose) | Contents |
 |---|---|---|
 | PostgreSQL | `postgres_data` volume | Users, projects, tasks, steps, events, execution runs, artifact registry, audit trail |
-| Artifact files | `workspace_data` volume (`/app/workspaces`) | Bytes of every registered artifact |
+| Artifact files | `${RAIVISOX_WORKSPACE_DIR:-./data/workspaces}` (host dir, `/app/workspaces`) | Bytes of every registered artifact |
 | Environment config | `.env` on the host | Secrets and provider configuration |
 
 The artifact **registry** (DB) and artifact **files** (volume) must stay
@@ -38,20 +38,21 @@ history.
 
 ## 3. Artifact storage backup
 
+The workspace is a **host directory**, not a named volume: the sandbox
+container is started through the `sandbox-worker` runtime socket, so the
+bind source must be the same absolute path on the host, in the worker and
+in the API (docs/deployment.md §10.7).
+
 ```bash
 # Backup (files + nothing else lives here)
-docker run --rm -v raivisox_workspace_data:/data -v "$PWD":/backup alpine \
-  tar czf /backup/workspaces_$(date +%Y%m%d).tar.gz -C /data .
+tar czf workspaces_$(date +%Y%m%d).tar.gz -C "${RAIVISOX_WORKSPACE_DIR:-./data/workspaces}" .
 
-# Restore (API stopped)
-docker compose -f docker-compose.prod.yml stop api
-docker run --rm -v raivisox_workspace_data:/data -v "$PWD":/backup alpine \
-  sh -c 'rm -rf /data/* && tar xzf /backup/workspaces_YYYYMMDD.tar.gz -C /data'
-docker compose -f docker-compose.prod.yml start api
+# Restore (API and worker stopped — nothing may write during the copy)
+docker compose -f docker-compose.prod.yml stop api sandbox-worker
+rm -rf "${RAIVISOX_WORKSPACE_DIR:-./data/workspaces}"/*
+tar xzf workspaces_YYYYMMDD.tar.gz -C "${RAIVISOX_WORKSPACE_DIR:-./data/workspaces}"
+docker compose -f docker-compose.prod.yml start sandbox-worker api
 ```
-
-Volume names may be prefixed by the compose project directory; list them
-with `docker volume ls | grep workspace`.
 
 **Consistency rule:** restore the database dump and the workspace
 archive from the same backup window when possible. Mismatched pairs

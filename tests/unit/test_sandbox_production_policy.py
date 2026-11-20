@@ -330,11 +330,40 @@ def _compose_directives() -> str:
     return "\n".join(line for line in lines if line.strip())
 
 
-def test_prod_compose_never_mounts_a_container_runtime_socket():
-    """A runtime socket in the API container is host-wide control (rejected)."""
+def _api_service_block() -> str:
+    """The API service's own directives (not the rest of the stack)."""
+    block: list[str] = []
+    inside = False
+    for line in _compose_directives().splitlines():
+        if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+            name = line.strip().rstrip(":")
+            if inside and name != "api":
+                break
+            inside = name == "api"
+            continue
+        if inside:
+            block.append(line)
+    return "\n".join(block)
+
+
+def test_prod_compose_never_mounts_a_runtime_socket_into_the_api():
+    """A runtime socket in the API container is host-wide control (rejected).
+
+    Since the dedicated worker exists (§10.7), the socket lives in that one
+    confined service instead — the API must still declare none, and the worker
+    must carry no API secret or database credential.
+    """
+    api = _api_service_block()
+    assert api, "api service block not found"
+    assert "sock" not in api
+    assert "privileged" not in api.lower()
+    assert "network_mode: host" not in api
+    # The only bind the API service declares is artifact storage. It is a
+    # host path (not a named volume) so the worker's sandbox containers can
+    # bind the same absolute path through the runtime socket.
+    assert "/app/workspaces" in api
+    assert "workspace_data" not in _compose_directives()
+
     directives = _compose_directives()
-    assert "sock" not in directives
     assert "privileged" not in directives.lower()
     assert "network_mode: host" not in directives
-    # The only bind/volume the API service declares is artifact storage.
-    assert "workspace_data:/app/workspaces" in directives
