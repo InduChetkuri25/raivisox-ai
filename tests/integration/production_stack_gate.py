@@ -462,7 +462,8 @@ def run_build_task(headers: dict, project: str) -> str:
     check("build task reached a verified outcome",
           task.get("status") == "completed" and task.get("outcome") == "verified",
           f"status={task.get('status')} outcome={task.get('outcome')}")
-    dod = ((task.get("result") or {}).get("definition_of_done") or {})
+    dod = (task.get("definition_of_done")
+           or (task.get("result") or {}).get("definition_of_done") or {})
     check("definition-of-done is applicable and satisfied",
           dod.get("applicable") is True and dod.get("satisfied") is True,
           json.dumps(dod)[:220])

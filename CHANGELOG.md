@@ -61,6 +61,12 @@ release-blocker review: none found) and the PostgreSQL Live Gate passed
 
 ### Fixed
 
+- **`docker-compose.prod.yml` could not be parsed at all** — the
+  `${SECRET_KEY:?…}` required-message contains `": "`, so YAML read the
+  `- SECRET_KEY=…` sequence item as a mapping and every compose command
+  (including the documented `up -d --build`) died with
+  `services.api.environment.[4]: unexpected type map[string]interface {}`.
+  The item is now quoted; the startup-fails-fast behaviour is unchanged.
 - **Worker-backed sandbox execution always failed** — the execution
   provenance (`task_id`/`run_id`/`step_id`) was passed through
   `SandboxSpec.env`, which the adapters set to `{}` and the worker's

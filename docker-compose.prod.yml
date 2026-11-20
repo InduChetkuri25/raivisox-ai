@@ -66,7 +66,9 @@ services:
       - DEBUG=false
       - APP_NAME=RAIVISOX AI API
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-raivisox}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-raivisox}
-      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required — generate with: openssl rand -hex 32}
+      # Quoted: the required-message contains ": ", which YAML would read as
+      # a mapping inside this sequence item. Keep it a plain string.
+      - "SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required — generate with: openssl rand -hex 32}"
       - CORS_ORIGINS=${CORS_ORIGINS:?CORS_ORIGINS is required — exact frontend origin(s)}
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:?ALLOWED_HOSTS is required — public API hostname(s)}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
