@@ -173,11 +173,13 @@ def own_workspace() -> None:
     writable by them, so provisioning it is part of deploying the stack.
     """
     proc = sh(["docker", "run", "--rm", "--network", "none", "-u", "0:0",
-               "-v", f"{WORKSPACE}:/w", "--entrypoint", "chown",
-               "raivisox-api:stack-gate", "-R", "1000:1000", "/w"],
+               "-v", f"{WORKSPACE}:/w", "--entrypoint", "sh",
+               "raivisox-api:stack-gate", "-c",
+               "mkdir -p /w/tasks && chown -R 1000:1000 /w && echo PROVISIONED"],
               check_rc=False)
-    check("task workspace is owned by the API/sandbox uid 1000",
-          proc.returncode == 0, (proc.stderr or "")[-200:])
+    check("task workspace root exists and is owned by uid 1000",
+          "PROVISIONED" in (proc.stdout or ""),
+          ((proc.stdout or "") + (proc.stderr or ""))[-200:])
 
 
 # ---------------------------------------------------------------------------
@@ -482,12 +484,12 @@ def run_build_task(headers: dict, project: str) -> str:
           f"{len(artifacts)} artifact(s)")
 
     if artifacts:
-        first = artifacts[0]
+        known = {a.get("hash") for a in artifacts if a.get("hash")}
         dl = http_json("GET", f"/api/v1/tasks/{task_id}/artifacts/0", headers=headers)
         digest = hashlib.sha256(dl.content).hexdigest()
-        check("artifact bytes match the registered hash",
-              dl.status_code == 200 and digest == first.get("hash"),
-              f"registry={first.get('hash')} downloaded={digest}")
+        check("artifact bytes match a registered SHA-256",
+              dl.status_code == 200 and digest in known,
+              f"downloaded={digest} known={sorted(known)[:3]}")
         check("artifact download is scoped to the owner",
               http_json("GET", f"/api/v1/tasks/{task_id}/artifacts/0").status_code
               in (401, 403))

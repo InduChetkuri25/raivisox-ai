@@ -509,15 +509,22 @@ any failure exits non-zero; nothing is skipped.
 ### 11.2 Workspace ownership (required)
 
 `RAIVISOX_WORKSPACE_DIR` must be an **absolute host directory owned by uid
-1000** (the API user and `SANDBOX_CONTAINER_USER`). A directory owned by any
-other uid is not writable by the API, and every run fails at its first file
-write. Provision it as root before the first start:
+1000** (the API user and `SANDBOX_CONTAINER_USER`), and it must already contain
+its `tasks/` subdirectory: the worker mounts `${RAIVISOX_WORKSPACE_DIR}` and
+refuses to start unless `/app/workspaces/tasks` exists — that check is what
+catches a forgotten or mis-pointed bind instead of silently writing into the
+image's own directory. A directory owned by any other uid is not writable by
+the API, and every run fails at its first file write. Provision both as root
+before the first start:
 
 ```bash
-install -d -o 1000 -g 1000 -m 0755 /srv/raivisox/workspaces
+install -d -o 1000 -g 1000 -m 0755 /srv/raivisox/workspaces /srv/raivisox/workspaces/tasks
 ```
 
-The gate does the same chown and asserts it.
+Symptom when it is missing:
+`RuntimeError: sandbox worker misconfigured: workspace root
+'/app/workspaces/tasks' does not exist; mount the shared workspace volume
+before starting the worker`. The gate provisions and asserts the same layout.
 
 ### 11.3 Start, health, shutdown
 
