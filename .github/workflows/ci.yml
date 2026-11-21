@@ -489,7 +489,7 @@ jobs:
           docker compose --env-file .stack-gate.env -f docker-compose.prod.yml \
             down --remove-orphans -v || true
           docker ps -aq --filter name=raivisox-sbx- | xargs -r docker rm -f || true
-          rm -rf .stack-workspaces .stack-gate.env
+          rm -rf .stack-workspaces .stack-gate.env || true
 
   frontend-validation:
     name: Frontend (typecheck + build)

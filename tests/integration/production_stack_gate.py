@@ -808,6 +808,21 @@ def check_workspace_security(headers: dict, project: str, run_id: str) -> None:
           not world_writable, str(world_writable[:3]))
 
 
+def reclaim_workspace() -> None:
+    """Empty the workspace so the caller can remove it.
+
+    Task files are written by uid 1000 (the sandbox user), so a plain `rm -rf`
+    from the CI user fails on them. Delete the contents from a throwaway
+    container as root; nothing outside the workspace is touched.
+    """
+    if not WORKSPACE.exists():
+        return
+    sh(["docker", "run", "--rm", "-u", "0:0",
+        "-v", f"{WORKSPACE}:/w", "--entrypoint", "sh",
+        "raivisox-api:stack-gate", "-c", "rm -rf /w/* /w/.[!.]*"],
+       check_rc=False)
+
+
 def check_container_cleanup() -> None:
     time.sleep(3)
     leftovers = sh(["docker", "ps", "-a", "--filter", "name=raivisox-sbx-",
@@ -882,6 +897,7 @@ def main() -> int:
         for name in sh(["docker", "ps", "-aq", "--filter", "name=raivisox-sbx-"],
                        check_rc=False).stdout.split():
             sh(["docker", "rm", "-f", name], check_rc=False)
+        reclaim_workspace()
 
     print(f"\n{PASSES} checks passed, {len(FAILURES)} failed", flush=True)
     if FAILURES:
