@@ -555,7 +555,10 @@ resumed.
 - **Event emission is on for the gate only.** `V3_EVENTS_ENABLED=1` is a CI
   input, not the production default (the V3 Phase 1 decision keeps graph
   events off outside dev/test/CI). Switching it on in production requires that
-  decision to be revisited.
+  decision to be revisited. The compose file passes `V3_EVENTS_ENABLED`
+  through when it is set; run provenance (the task/run attribution the worker
+  boundary requires) is resolved on every run **regardless** of the flag, so
+  disabling events never disables execution.
 - **Idempotency is per-process memory.** A worker restart forgets completed
   request ids, so a retry after a restart can execute again; the API only
   retries on transport errors within one call. Exactly-once execution is not
