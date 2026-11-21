@@ -404,6 +404,17 @@ def tool_steps(events: list[dict]) -> list[tuple[str, str, str]]:
     return out
 
 
+def dump_task_diagnostics(task_id: str, headers: dict, task: dict) -> None:
+    """Print why a pipeline task did not reach the expected terminal state."""
+    print(f"--- diagnostics for task {task_id} ---", flush=True)
+    print(json.dumps(task.get("result") or {}, indent=2, default=str)[:4000], flush=True)
+    for ev in task_events(task_id, headers):
+        payload = ev.get("payload") or {}
+        print(f"  event {ev.get('event_type')} step={payload.get('step_id')} "
+              f"{json.dumps(payload, default=str)[:600]}", flush=True)
+    print(f"--- end diagnostics for task {task_id} ---", flush=True)
+
+
 def latest_run_id(task_id: str) -> str:
     return psql(f"select id from execution_runs where task_id='{task_id}' "
                 "order by started_at desc limit 1")
@@ -461,8 +472,10 @@ def run_build_task(headers: dict, project: str) -> str:
           dup.text[:160])
 
     task = poll_task(task_id, headers)
-    check("build task reached a verified outcome",
-          task.get("status") == "completed" and task.get("outcome") == "verified",
+    verified = task.get("status") == "completed" and task.get("outcome") == "verified"
+    if not verified:
+        dump_task_diagnostics(task_id, headers, task)
+    check("build task reached a verified outcome", verified,
           f"status={task.get('status')} outcome={task.get('outcome')}")
     dod = (task.get("definition_of_done")
            or (task.get("result") or {}).get("definition_of_done") or {})
@@ -506,7 +519,7 @@ def run_build_task(headers: dict, project: str) -> str:
     steps = tool_steps(task_events(task_id, headers))
     tools = {tool for _s, tool, _m in steps}
     check("pipeline ran real adapters (no simulated success claim)",
-          steps and all(mode == "real" for _s, _t, m in steps),
+          steps and all(m == "real" for _s, _t, m in steps),
           f"tools={sorted(tools)}")
     check("codegen and the sandboxed solve probe executed",
           "codegen" in tools, f"tools={sorted(tools)}")
@@ -672,9 +685,16 @@ def check_worker_unavailable(headers: dict, project: str) -> None:
               wait_health(CONTAINERS["worker"], 240))
 
 
-def check_worker_auth(headers: dict, project: str) -> None:
-    task_id = http_json("GET", "/api/v1/tasks", headers=headers).json()["tasks"][0]["id"]
-    run_id = latest_run_id(task_id) or "run"
+def scope_task(headers: dict, project: str, run_id: str,
+               title: str = "stack gate scope") -> tuple[str, str]:
+    """A task with a real, existing workspace scope (and a real run id)."""
+    task_id = make_task(headers, project, title, "Analyze the data")
+    seed_input(task_id, "note.md", "scope\n")
+    return task_id, run_id
+
+
+def check_worker_auth(headers: dict, project: str, run_id: str) -> None:
+    task_id, run_id = scope_task(headers, project, run_id, "stack gate auth probe")
     code = (
         "import asyncio, json\n"
         "from services.execution.remote_sandbox import WorkerSandbox\n"
@@ -691,10 +711,10 @@ def check_worker_auth(headers: dict, project: str) -> None:
           "401" in out and "AUTH_RESULT None" in out, out[-220:])
 
 
-def check_capacity(headers: dict, project: str) -> None:
+def check_capacity(headers: dict, project: str, run_id: str) -> None:
     """The worker serializes beyond its concurrency ceiling instead of running unbounded."""
-    task_id = http_json("GET", "/api/v1/tasks", headers=headers).json()["tasks"][0]["id"]
-    run_id = latest_run_id(task_id) or "run"
+    task_id, run_id = scope_task(headers, project, run_id, "stack gate capacity")
+
     code = (
         "import asyncio, time\n"
         "from services.execution.remote_sandbox import WorkerSandbox\n"
@@ -730,8 +750,8 @@ def _capacity_serialized(out: str) -> bool:
     return False
 
 
-def check_workspace_security(headers: dict, project: str) -> None:
-    task_id = http_json("GET", "/api/v1/tasks", headers=headers).json()["tasks"][0]["id"]
+def check_workspace_security(headers: dict, project: str, run_id: str) -> None:
+    task_id, run_id = scope_task(headers, project, run_id, "stack gate security")
     other = make_task(headers, project, "stack gate sibling", "Analyze the data")
     seed_input(other, "secret.txt", "sibling-secret\n")
 
@@ -747,7 +767,6 @@ def check_workspace_security(headers: dict, project: str) -> None:
     )
     planted = "LINKED" in out
 
-    run_id = latest_run_id(task_id) or "run"
     probe_code = (
         "import asyncio, json\n"
         "from services.execution.remote_sandbox import WorkerSandbox\n"
@@ -841,15 +860,16 @@ def main() -> int:
         run_timeout_task(headers, project)
 
         print("=== failure and restart behaviour", flush=True)
-        check_worker_auth(headers, project)
-        check_capacity(headers, project)
+        build_run = latest_run_id(build_task) or str(uuid.uuid4())
+        check_worker_auth(headers, project, build_run)
+        check_capacity(headers, project, build_run)
         check_restart_worker(headers, project)
         check_restart_api(headers, project)
         check_restart_postgres(headers)
         check_worker_unavailable(headers, project)
 
         print("=== shared workspace security", flush=True)
-        check_workspace_security(headers, project)
+        check_workspace_security(headers, project, build_run)
         check_container_cleanup()
 
         # Cross-user isolation on a real artifact surface.
