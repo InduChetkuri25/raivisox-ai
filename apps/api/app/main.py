@@ -2591,14 +2591,26 @@ async def run_task_pipeline(
     await db.refresh(execution_run)
     run_id = execution_run.id
 
-    # ---- 0b. V3 Phase 1 provenance (one query per run, flag-gated) -----
-    # The handle is resolved and verified BEFORE any step runs, so no event is
-    # ever written with an unverified user. Flag-off keeps today's behaviour
-    # byte-for-byte (no extra query, no writes).
+    # ---- 0b. Trusted run provenance (one query per run) ------------------
+    # Resolved and verified BEFORE any step runs. This is NOT gated on
+    # V3_EVENTS_ENABLED: the sandbox worker boundary requires the task/run
+    # identity to attribute an execution (and refuses an anonymous one), so
+    # disabling event emission must never disable execution attribution.
+    # Only the graph-event writes stay flag-gated.
     run_provenance = None
-    if graph_events.events_enabled():
+    try:
         run_provenance = await resolve_run_provenance(
             db, task_id, run_id, actor_id=PIPELINE_ACTOR
+        )
+    except ProvenanceError:
+        if graph_events.events_enabled():
+            raise
+        # Events off: no rows can be written with an unverified subject, and
+        # the sandbox boundary will refuse the run honestly instead of
+        # inventing an owner.
+        logger.warning(
+            "run provenance unresolved task_id=%s execution_run_id=%s",
+            task_id, run_id,
         )
 
     # Identifies THIS execute invocation in artifact history (reruns keep

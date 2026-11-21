@@ -77,6 +77,14 @@ release-blocker review: none found) and the PostgreSQL Live Gate passed
   `AdapterContext`, and the worker enforces it as before. Found and fixed
   by the full-stack acceptance gate; the container/process backends and the
   isolation gate are unaffected.
+- **Worker-backed execution failed whenever graph events were disabled**
+  (the production default) — `run_task_pipeline` only resolved the trusted
+  task/run provenance when `V3_EVENTS_ENABLED` was on, so with the flag off
+  the adapter context carried no `run_id` and the worker refused every
+  sandboxed run. Provenance is now resolved unconditionally (one query per
+  run); only the graph-event writes remain flag-gated. The flag itself is
+  also declared in the production compose file, so setting it for an
+  environment actually reaches the API container.
 - **PostgreSQL artifact registration** — the same-path supersession
   write-lock used the SQLite boolean literal `is_current = 1`, which
   PostgreSQL rejects (`operator does not exist: boolean = integer`);
